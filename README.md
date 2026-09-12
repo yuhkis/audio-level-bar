@@ -1,0 +1,178 @@
+# Audio Level Bar
+
+**English** | [日本語](README.ja.md)
+
+A lightweight macOS menu bar app that keeps the current speaker volume setting and the live microphone input level in the menu bar (with one deliberate exception for Bluetooth microphones, described under Permissions and privacy). It can also show the live level of the system playback signal, as an opt-in. Clicking the menu bar item lets you pick the default input and output devices, and adjust the volume or input gain whenever Core Audio allows it. Launched from the Finder, it brings up a control window with the same contents, so it stays usable when the menu bar item is hidden behind the notch or a menu bar manager. Version 0.4.0 can publish a local virtual input called “Audio Level Bar Microphone” — only when you turn it on explicitly — carrying digital gain and either Apple voice processing or WebRTC noise suppression.
+
+## Project status
+
+This is a personal project built in spare time. The app's own code is under the MIT License in the root [`LICENSE`](LICENSE). The grant follows origin rather than directory: the upstream license texts kept under `ThirdParty/` and the upstream code compiled into the static library under `Vendor/` are not covered by it, and their own [third-party licenses](THIRD_PARTY_NOTICES.md) take precedence. The small C ABI wrapper that sits beside them is this project's own code and is MIT like the rest; every source file of it carries an SPDX header saying so.
+
+Issues and pull requests are welcome, but this is spare-time work and no response or turnaround is promised. Requests may go unanswered, may take a long time, or may be declined when they do not fit the project's direction. It is provided without warranty, as the MIT License states, and you use it at your own risk. Because it sits in the audio path, please confirm it behaves as you expect on your own machine before an important recording or meeting.
+
+No signed `.app` is distributed for general use yet. An app built from source is ad-hoc signed by default, or signed with a certificate you name yourself (see [Building and running](#building-and-running)); Developer ID signing and notarization have not been done. **The processed microphone is an experimental feature** — see [Processed microphone (experimental)](#processed-microphone-experimental) for what that means in practice, including a documented limitation and a way to wedge Core Audio for the whole machine. Everything else — the menu bar meters, device selection, volume and input gain, mute, and system playback level monitoring — is in ordinary use.
+
+The app's interface is available in English and Japanese, and follows your macOS language setting.
+
+## What it shows
+
+- Menu bar, top row: normally the speaker volume setting. While system playback monitoring is on, the RMS value of the real playback signal in dBFS, a bar, and a white vertical line at the output volume position
+- Menu bar, bottom row: a microphone icon, the RMS value of the real input in dBFS, and a bar underneath
+- Popup / control window: input and output device pickers with the standard macOS icon for each device class, an enlarged level display with numbers, peak values, volume and input gain, mute, and the processed microphone settings. The enlarged meters also carry the white line — output volume for the speaker, input gain for the microphone. The volume and input gain sliders span the same full width as the enlarged meters. “Sound Settings” at the bottom opens the macOS Sound settings. An AirPlay button at the right end of the output row opens the output list in those same settings, where AirPlay receivers are offered
+- Right-click on the menu bar item: a menu for toggling speaker and microphone mute, the settings screen, the control window, and quitting
+
+The menu bar stacks a row of icon plus small number above a bar, for the speaker and the microphone in turn, keeping the width small. The white vertical line is drawn over the microphone bar for input gain, and over the speaker bar for output volume while system playback monitoring is on — but only when the value can actually be read. When a value or a required permission is unavailable — or a Bluetooth default input is deliberately left unmonitored (see [Permissions and privacy](#permissions-and-privacy)) — the live number reads `--` and the corresponding bar stays empty; an unreported value is never treated as 100%.
+
+Opening the app from the Finder centers a compact 400×640 control window that is easier to read. When settings or errors exceed the space, only the middle scrolls, and the header and the quit control stay put. Closing the window leaves the app running in the menu bar, and opening the already-running app from the Finder again brings the control window back.
+
+Mute can be toggled from the speaker and microphone icons in the popup, from the right-click menu on the menu bar item, or from the keyboard. The shortcuts are ⌘M for the speaker and ⇧⌘M for the microphone; they work while the popup or the control window has focus, and while the right-click menu is open. They do not work while you are in another app. On a device that does not support mute, the icon is a status indicator rather than a button.
+
+Muting looks the same for the speaker and the microphone. The icons in the menu bar and the popup gain a red slash; the menu bar number and line, the enlarged meter's number and line, the peak value, and the volume and input gain percentages all turn red; and a red “Muted” appears next to the device picker in the popup.
+
+While system playback monitoring is on, the internal digital signal meter keeps moving even when muted. A number that moves while red means the signal is flowing but nothing is actually audible.
+
+Right-clicking (or control-clicking) the menu bar item shows “Mute Speaker”, “Mute Microphone”, “Settings…”, “Open Control Window”, and “Quit Audio Level Bar”. The two mute items switch to “Unmute” according to the current state, and are dimmed on a device that does not support mute. “Settings…” opens the popup on the settings screen. Left-clicking is unchanged and always toggles the popup on the meter screen.
+
+The bar is grey in the low range, green at or above the green threshold you set, and red at or above the red threshold. Thresholds are set separately for the speaker and the microphone, and can be changed from “Settings” at the top right of the popup or “Settings…” in the right-click menu. A live signal maps −60 to 0 dBFS onto 0 to 100%, and a speaker with system playback monitoring off uses the output volume percentage instead. The values are stored on this Mac and carried over to the next launch.
+
+- Microphone defaults: green at −30 dBFS (50%), red at −6 dBFS (90%). Green covers the range that suits speech recognition and online meetings. Aim for mostly green while you speak, and adjust the input gain so it does not stick at red. Below −30 dBFS the margin over noise gets thin, and above −6 dBFS peaks approach clipping
+- Speaker defaults: green at 25% (−45 dBFS / volume 25%), red at 90% (−6 dBFS / volume 90%). Since the playback level cannot be adjusted from here, green is deliberately broad and means “sound really is coming through”, while red means “quite loud, possibly too loud”
+
+System playback level monitoring is off by default. Turning it on explicitly from “Settings” monitors the system playback audio being sent to the current default output device through a Core Audio process tap, and switches the top row to the live signal's RMS value and bar. What it reads is the digital signal level, not the physical sound pressure coming out of the speakers. Turning monitoring off returns the top row to the output volume setting, which needs no extra permission.
+
+## Processed microphone (experimental)
+
+> **This feature is experimental.** It works, and it is used day to day, but it carries a documented limitation that has no workaround inside the app (see [Known limitation](#known-limitation-a-second-open-in-the-same-process-is-silent)), and one operating rule you have to follow to avoid taking Core Audio down for the entire machine (see [Do not force quit](#do-not-force-quit-while-the-processed-microphone-is-published)). Speech quality in the apps that use it — clipped starts and dropouts in QuickTime Player, Zoom, or Teams — has not been systematically verified. Everything else in the app is unaffected by turning it off.
+
+The processed microphone is off by default. Turning it on applies processing to the audio captured from the current physical default input, and publishes a local virtual input on macOS named “Audio Level Bar Microphone”. To use it from Teams, Zoom, a recording app, and so on, select that name explicitly in the app's own microphone settings. The physical macOS default input is left unchanged, so an app still set to “Same as System Settings” goes on using the unprocessed microphone.
+
+- Digital gain: −12 to +12 dB, default 0 dB. When the device's own input gain is adjustable, two sliders are shown — input gain and digital gain. Digital gain remains available even when the device gain cannot be changed
+- Processing mode: off by default. “Apple voice processing”, “WebRTC noise suppression (low/moderate/high)”, and “Off” are mutually exclusive choices. Changing the mode rebuilds the audio path, for safety
+- Apple voice processing: uses Apple's Voice Processing for noise suppression and echo cancellation, with AGC (automatic gain control) disabled. Apple's public API does not let you choose the strength of noise suppression alone. Other playback audio may drop in volume temporarily while it runs
+- WebRTC noise suppression: uses only the noise suppression of the WebRTC Audio Processing Module. Low, moderate, and high correspond to target suppression of 6, 12, and 18 dB in the implementation, and WebRTC's own AGC and echo cancellation are not used. It does not depend on Apple's input/output configuration, but it does add about 10 ms of fixed buffer latency
+
+Processing runs only while a consuming app actually has “Audio Level Bar Microphone” open. While no app is using it, the virtual input stays published and the processing engine stops; the status reads “Publishing … (idle)” and the 🎙 meter shows the unprocessed microphone level. When a consuming app selects it, the status changes to “in use” and the meter shows the processed level. Apple voice processing costs about 15% of one core when running continuously, so it is not run while idle (measured: about 1% idle, about 16% in use; idling after Apple voice processing has run once settles around 3%). A brief moment of silence can occur right after it starts.
+
+With digital gain at 0 dB and the processing mode off, DSP processing is bypassed. Even so, while the processed microphone is on, audio still travels the virtual input path, so latency and format conversion are not necessarily identical to the direct path. To return completely to the metering-only behavior, turn the processed microphone off. Stopping it shuts down the processing engine, the process tap, and the virtual input, and returns to the earlier behavior, which never changes the physical default input.
+
+If the consuming app's own noise suppression is also on — in Teams or Zoom, for example — processing is applied twice and the voice can sound unnatural. When comparing Apple against WebRTC, turn off the consuming app's noise suppression and automatic volume control, and switch one mode at a time with the same microphone, input gain, digital gain, and mouth distance. Steady noise such as air conditioning or fans lets you compare noise suppression in both modes, but speaker bleed is a separate comparison, since only Apple — which includes echo cancellation — can help there. When used together with system playback monitoring, Audio Level Bar's own publisher signal is excluded from the speaker meter.
+
+If the selected processing mode fails at start or during processing, only that mode is turned off automatically and retried once, while digital gain and the virtual input keep running. The warning shown includes the actual error.
+
+### Known limitation: a second open in the same process is silent
+
+Once a consuming process has opened the device and released it completely, every later open **from that same process** receives all-zero samples. In practice this covers a second recording in QuickTime Player, re-joining a call without quitting the app, and apps that briefly open the device before recording for real. The workaround is to quit and reopen the consuming app.
+
+The cause is a macOS-side defect in aggregate devices that contain a process tap, and it persists for as long as the aggregate device keeps the same `AudioObjectID`. The tap itself is alive — a brand-new process receives every sample from the same publication at the same moment — and replacing the tap does not fix it.
+
+Rebuilding the publication whenever it returns to idle was implemented and then withdrawn. Within a few cycles, the wait for the destroyed aggregate's UID to disappear from the device list times out, and the code cannot recover from that: the device vanishes from every app's input list. That is worse than silence, so it is not shipped.
+
+A real fix requires moving to a virtual audio driver (`AudioServerPlugIn`), which changes the distribution model (root-privileged install, Developer ID, notarization). That is a separate milestone. 0.4.0 ships with this limitation documented.
+
+### Do not force quit while the processed microphone is published
+
+Force-quitting the app while the processed microphone is published can leave `coreaudiod` unable to answer new clients. After that, **every** audio app on the machine blocks on its first HAL call. `coreaudiod` looks alive at 0% CPU, so it presents as a bug in whatever app you try next.
+
+While SIP is enabled, `sudo killall coreaudiod` and `launchctl kickstart` are both refused and logging out does not help, so **recovery takes a restart of the Mac**. Quit through the app's own Quit item, or:
+
+```bash
+osascript -e 'tell application id "io.github.yuhkis.audio-level-bar" to quit'
+```
+
+The normal shutdown path is sound, and both the aggregate device and the tap are destroyed. Resources leak only when the process dies without completing teardown. If that happens, the app reclaims its own stranded taps at the next launch, on macOS 26 or later — below that the creating bundle of a tap cannot be read, so none can be attributed. To check whether Core Audio itself is wedged rather than the app, run `make diagnose`: it starts with a time-limited HAL probe and tells you when the problem is machine-wide.
+
+## Requirements
+
+To run:
+
+- macOS 14.2 or later (development and verification target macOS 26 Tahoe)
+- An Apple Silicon Mac (the bundled WebRTC comparison XCFramework is arm64)
+
+To build:
+
+- **The macOS 26 SDK or later.** `CATapDescription.bundleIDs` is used to decide which stranded process taps belong to this app, so an older SDK cannot compile the source. The resulting app still runs on macOS 14.2, because the call is guarded with `#available` at runtime
+- Swift 6.1 or later / Xcode Command Line Tools
+
+## Building and running
+
+These run from the project root in any shell, fish included.
+
+```console
+make test
+make diagnose
+make app
+make verify-app
+make install
+make install-login-agent
+make check-localization
+make ci
+make run
+```
+
+`make diagnose` starts neither the GUI, the microphone, nor system audio monitoring. It prints: the input and output devices that can be chosen as the default and have real channels, their channel counts, the current defaults, and whether volume can be read and changed; each device's mute state and whether it can be toggled; and the list of aggregate devices and published process taps, with each one identified as Audio Level Bar's or another app's. It begins with a time-limited check of whether Core Audio as a whole responds, and if it does not, prints only that and exits (this state is not specific to the app, and while SIP is enabled it can only be cleared by restarting the Mac).
+
+`swift run AudioLevelBar --reclaim-taps` destroys process taps left behind by an earlier abnormal exit. The app does the same thing automatically at every launch, so you normally do not need it. It refuses to run while Audio Level Bar is running, because a tap in use cannot be told apart from a stranded one, and it does not run below macOS 26, where the creating bundle cannot be read. `make app` produces `dist/Audio Level Bar.app` and signs it, ad hoc unless you name a certificate (below). From a Git clone it embeds the commit SHA, the clean/dirty state of the working tree, a source fingerprint, and a reproducible provenance timestamp (the HEAD commit time) into `Info.plist`. From a source archive without Git metadata — a GitHub Download ZIP, for instance — it records the commit and timestamp as `source-archive` and embeds a fingerprint of the extracted contents. `make verify-app` checks the bundle identifier, version/build, embedded provenance, the arm64 executable, the minimum system version, the code signature (ad hoc, or the certificate named by `CODESIGN_IDENTITY` together with the hardened runtime and the audio-input entitlement it requires), the bundled `en.lproj` and `ja.lproj` string tables, and that the bundled project `LICENSE` and third-party licenses match the source. `make check-localization` checks that every string looked up in the source exists in both localizations, and that neither table carries a key nothing uses. `make ci` runs metadata checks, the localization check, the bundled WebRTC binary checks, the smoke test, the Swift unit tests, and the app build and verification together. `make run` builds the app and opens it.
+
+`make app` signs ad hoc by default. Signing is opt-in: the keychain may hold certificates issued to someone else, and picking one automatically would publish the app under their identity, so the script never chooses a certificate on its own and never creates or installs one. To sign with a certificate you own, name it explicitly (this is the same contract as [wkr-macos](https://github.com/yuhkis/wkr-macos)):
+
+```console
+env CODESIGN_IDENTITY='<name of your certificate>' make app
+```
+
+With ad-hoc signing, every rebuild is a different app to macOS. The designated requirement is the binary's hash — `codesign -d -r- "dist/Audio Level Bar.app"` shows `cdhash H"…"` — so microphone and system audio recording permission have to be granted again after each build. A certificate signature turns the requirement into `identifier "io.github.yuhkis.audio-level-bar" and certificate leaf = H"…"`, which survives rebuilds. As long as you do not distribute the result, no Apple Developer Program membership is needed for that; a self-signed code-signing certificate is enough. In Keychain Access, open Certificate Assistant → Create a Certificate, pick a name (for example `audio-level-bar-local`), set Identity Type to Self Signed Root and Certificate Type to Code Signing, tick “Let me override defaults” and lengthen the validity period (the default is 365 days; when it expires you create a new certificate and grant the permissions once more), then run `env CODESIGN_IDENTITY=audio-level-bar-local make app`. Such a certificate is listed as `CSSMERR_TP_NOT_TRUSTED` rather than valid by `security find-identity -v -p codesigning`, but `codesign` signs and verifies with it without any change to trust settings. A certificate signature is applied with the hardened runtime and a secure timestamp (which needs network access), and carries the `com.apple.security.device.audio-input` entitlement from `Resources/AudioLevelBar.entitlements`, because the hardened runtime denies microphone input without it. Switching between ad-hoc and certificate signing costs one more round of permission prompts, after which a certificate-signed build keeps them across rebuilds; an ad-hoc rebuild asks again every time. A certificate-signed build has been run on a Mac: the microphone meter and system playback level monitoring both work under the hardened runtime with the entitlement. Unplugging and reconnecting devices, and the processed microphone, have so far been exercised only on ad-hoc builds. Sleep and wake has not been verified on any build yet, so the hardware gate in [ROADMAP.md](ROADMAP.md) — which covers unplugging and sleep/wake — is still open. Passing a `.app` to other people still requires Developer ID signing and notarization, which this project has not done.
+
+macOS asks for microphone permission at first launch. System audio recording permission is requested the first time you turn on system playback level monitoring or the processed microphone in Settings. An ad-hoc signature gives the app no durable code identity, across rebuilds or across machines, so check the permission state on each Mac; signing with your own certificate keeps the identity stable across rebuilds on one Mac (see above).
+
+## Installing and everyday use
+
+The canonical app for everyday use is `/Applications/Audio Level Bar.app`; `dist/Audio Level Bar.app` is a build and verification artifact. Do not run both at once. The app prevents multiple instances with a per-user lock, but for real-device verification of a development build, quit the `/Applications` copy first, and afterwards quit the development build and go back to the canonical one.
+
+To update the canonical copy, quit the app, get `make app` and `make verify-app` to succeed, then run `make install`. The only canonical target `make install` changes is `/Applications/Audio Level Bar.app`; it does not switch the LaunchAgent. It re-verifies the candidate bundle, keeps the existing canonical copy as a timestamped backup, replaces it, and verifies again afterwards. Once you have launched the canonical copy and confirmed it works with the permissions it needs, quit it and run `make install-login-agent`. That command is refused while Audio Level Bar is running, assumes a verified `/Applications` copy, and switches only the login item target. When installing on more than one Mac, do not rebuild per machine: transfer the same bundle built and verified on the first Mac, and confirm the signature, SHA-256, version/build, and embedded provenance match on each.
+
+Settings are stored under the bundle identifier `io.github.yuhkis.audio-level-bar`; nothing is migrated from another defaults domain. Inside that one domain, three older key names are still read, each only while the current key holds nothing: the menu bar item position under AppKit's generic `NSStatusItem Preferred Position Item-0`, which is where it is saved until the app sets an autosave name of its own; the single pair of meter color thresholds that the speaker and the microphone used to share; and the on/off flag that preceded the microphone processing mode.
+
+The Core Audio UID of the published processed microphone is `io.github.yuhkis.audio-level-bar.processed-microphone.public`. It is fixed, so an app that has selected “Audio Level Bar Microphone” — Zoom, Teams, or a recording app — keeps that selection when the microphone is published again.
+
+The completion criteria for publication and the distribution policy are recorded in [ROADMAP.md](ROADMAP.md).
+
+An ordinary app build uses an arm64 XCFramework bundling a pinned version of the WebRTC APM and Abseil, included under `Vendor/`, so the repository itself contains static binaries used for building. Separately, no `.app` is distributed as a release asset: handing one to other people would need Developer ID signing and notarization, which this project has not done. The SHA-256 of the binaries and of the pinned sources, plus the steps to regenerate them, are tracked in `ThirdParty/WebRTCNoiseSuppression/README.md`; the licenses and PATENTS file are reachable from [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The app never connects to WebRTC or any external service while running.
+
+## Permissions and privacy
+
+The microphone is monitored while the app runs, so that the real input level can be displayed, and the orange macOS microphone-in-use indicator is lit while it is. The exception is a Bluetooth default input with the default settings: it is monitored only while the popup or the control window is showing, as the next paragraph but one explains, and the indicator is off the rest of the time. Turning on system playback level monitoring or the processed microphone additionally uses the “Screen & System Audio Recording” permission.
+
+While the processed microphone is off, audio samples are discarded immediately after the RMS and peak values are computed. While it is on, processed samples are forwarded in real time to a virtual input inside this Mac, so that the consuming app you selected can read them. In both cases Audio Level Bar itself neither records nor stores audio, and never transmits it over the network. Recording or transmission by the consuming app follows that app's own settings and behavior.
+
+Bluetooth headsets such as AirPods cannot carry high-quality playback and a microphone at the same time: opening their microphone drops the whole link into call mode, and playback stays degraded for as long as anything holds the input open. By default, therefore, when the default input is a Bluetooth device, the always-on meter runs only while the popup or the control window is showing, and the menu bar shows `--` for the microphone the rest of the time. Closing the last panel releases the microphone, and the headset renegotiates back to high-quality playback within several seconds. “Always monitor Bluetooth microphones” in Settings restores continuous metering, at the cost of degraded playback for as long as a Bluetooth microphone stays the default input. Microphones on other transports are always metered, and so is any input while the processed microphone is on — that feature needs the input available at all times and is an explicit opt-in.
+
+If you deny microphone access, speaker volume and input/output device selection still work. Only the microphone level reads `--`, and the processed microphone is unavailable. If you deny system audio recording, the live playback level stays empty and only the readable output volume is drawn as a white line, and the processed microphone's virtual input cannot be published. Turning each feature off returns to the earlier behavior, which uses no additional permissions.
+
+## Per-device constraints
+
+For USB microphones, audio interfaces, HDMI outputs, and so on where macOS does not allow the volume property to be changed, the corresponding device-side slider is not shown. Use the gain or volume control on the device itself. When the processed microphone is on, the digital gain that follows it is available regardless of whether the device-side input gain can be changed. An unreported device volume is never assumed to be 100%.
+
+An AirPlay receiver does not become a Core Audio device until it is connected, and macOS gives no app but its own a way to list the receivers that are merely reachable on the network. So they cannot appear in this app's output picker by themselves. Use the AirPlay button beside the output picker to connect one in the macOS Sound settings. Once connected it is an ordinary output device here, with a working volume slider and mute. It is named simply “AirPlay”, not after the receiver: macOS passes no receiver name, model, or data source down to Core Audio, so no app outside its own can say which destination the audio is going to.
+
+Zoom, Teams, recording apps, and others that pin a device on their own may not follow the macOS “default device” you change here. To make such an app follow the physical input, set it to “Same as System Settings”; to use the processed microphone, select “Audio Level Bar Microphone” explicitly.
+
+## Development
+
+Run this once on each Mac, right after cloning.
+
+```console
+make setup-dev
+```
+
+It points `core.hooksPath` at `scripts/git-hooks`, creates the template for `.local/private-patterns.txt`, and pins **your own** Git identity to this clone — taken from an existing repo-local setting, then `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL`, then your global setting. It never assigns an identity of its own. Once pinned, the identity no longer follows later changes to your global setting. It does not vet the address it copies, though: if your global setting carries a workplace address, that is the address it pins, and `pre-commit` refuses no address beyond `*.local` unless you add suffixes of your own (see below). It prints the identity it pinned and asks you to check it; if it is not one you are willing to publish, set one in this clone with `git config user.email` before your first commit. A GitHub noreply address works well.
+
+From then on, `pre-commit` checks the commit identity, the names of the files a commit adds, changes, or swaps between a file and a symlink, and the lines it adds. `pre-push` checks what a push would publish: the local and remote name of every ref being pushed, the author and committer identities and the message of every commit, the lines each of those commits adds and the file names it touches, every annotated tag (its tagger and message), and — for a tag or ref that points at a tree or a blob rather than a commit — every name and blob underneath it. Both read binary files, and files marked `binary` (or `-diff`) in `.gitattributes`, as text, so a value inside one is scanned like any other. Only added lines are scanned, so a commit that removes a private string is not refused for carrying it on its deletion lines.
+
+The checks cover `/Users/…` paths and home-relative `~/…` and `$HOME/…` paths — `~/Library` and `~/Applications` are allowed as standard locations, except for the cloud-sync folders under `~/Library` and anything that walks back out with `..`, however deep the `..` sits — along with `*.local` email addresses, Apple signing certificate subjects, private keys, and GitHub, AWS and Slack tokens, plus any string written in `.local/private-patterns.txt`. That file is git-ignored, and nothing that matches is echoed: a hit is reported as a reason and the line numbers it was found on, never as the text itself. Write the values that must not be published — names, host names, Team IDs, non-public organization names — there, per Mac. The list belongs to the repository rather than to one working tree, so a linked worktree checks against the same values, and a file holding no values says so on every run instead of passing silently. Matching is by substring and ignores case for ASCII letters only, so a value with accented or full-width letters needs each case form on its own line. The shipped hook refuses only `*.local`, since one contributor's domain must not lock out everyone else at that institution. To refuse further address suffixes in commit identities — a workplace domain, say — add them per clone with `git config audiolevelbar.blockedEmailSuffixes '.example.edu'` — the value is the suffix itself, `.example.edu`, with no leading `*`; what you set is added to `*.local`, not a replacement for it. Only `pre-commit` reads that setting, so a commit that arrives by pull or cherry-pick, or one made with `--no-verify`, is not refused for those suffixes later; a `*.local` address is caught at push time as well, because it is one of the checks above.
+
+`make audit-history` applies the same checks to everything already in the repository: every ref name, the identity and message of every commit, every file name (in every commit, and under a ref that points straight at a tree or a blob), every blob whatever its size, and every annotated tag object (tagger and message). It lists the identities the history carries before scanning them, so you can read them yourself. When `origin` is set it first fetches `refs/pull/*/head`, because a pull-request head ref outlives the branch it came from and cannot be removed later; it fails if that fetch fails, and deletes the fetched refs again on the way out. Without an `origin` those refs are not covered, and it says so. Run it before switching the repository to public, and before pushing to a new remote — from a clone whose `origin` is the repository being published.
+
+Work logs stay out of the repository. `WORKLOG.md`, `NOTES.md`, and `TODO.local.md` are git-ignored. A work log, once published, cannot be taken back, and device and personal names stay in it forever.
+
+User-facing text is looked up with `localized(...)` from `Sources/AudioLevelBarCore/Localization.swift`, keyed by the English wording, and translated in `Resources/en.lproj/` and `Resources/ja.lproj/`. Adding or rewording a string means updating `Resources/ja.lproj/Localizable.strings` in the same change; `make check-localization` fails on a key that is missing from either table, used by nothing, or whose English table entry is not identical to its key. The diagnostics output of `make diagnose` is developer-facing and stays English-only, since it runs outside the app bundle where no string table is available.
+
+The structure and design decisions are in [DESIGN.md](DESIGN.md), the settled publication and distribution policy in [ROADMAP.md](ROADMAP.md), how to contribute in [CONTRIBUTING.md](CONTRIBUTING.md), security reporting in [SECURITY.md](SECURITY.md), the project license in [LICENSE](LICENSE), third-party licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and the working rules for coding agents in [AGENTS.md](AGENTS.md), with the task-specific detail on verification, candidate builds and installation, and localization in the [development reference](docs/development.md). Participation is covered by the [code of conduct](CODE_OF_CONDUCT.md). `DESIGN.md` and `ROADMAP.md` are Japanese-only; `AGENTS.md` and `docs/development.md` are English-only. When you add a setting, a command, or a shortcut, update the README or DESIGN in the same change as the implementation.

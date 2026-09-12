@@ -1,0 +1,125 @@
+#!/bin/sh
+# Last gate before anything leaves this machine.
+#
+# The pre-commit hook only sees what this machine commits. This one sees
+# everything the push would publish, including commits that arrived by pull,
+# merge, or cherry-pick from another machine, so it is the check that actually
+# protects a public remote. For every pushed commit it scans the author and
+# committer identities, the message, the lines the commit adds, and the file
+# names it adds or changes; for every annotated tag being pushed, the tag
+# object itself (tagger and message).
+#
+# Only added lines are scanned. A diff also carries the lines it removes, and
+# scanning those would refuse precisely the commit that takes a string out.
+set -eu
+# Read bytes, not characters, like the scanner this feeds. In a UTF-8 locale
+# the system sort prints nothing for input holding an invalid byte, so a
+# single Latin-1 file name can empty the whole file-name scan.
+LC_ALL=C
+export LC_ALL
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+scan=scripts/scan-private-content.sh
+# Fail closed. `make setup-dev` creates the hook path and the scanner together,
+# so a missing or non-executable scanner means this clone is not set up, not
+# that there is nothing to check — and this is the last gate before a push.
+if [ ! -x "$scan" ]; then
+    printf 'BLOCKED the content scanner is missing or not executable: %s\n' "$scan" >&2
+    printf 'BLOCKED 検査スクリプトが無いか実行権限がありません: %s\n' "$scan" >&2
+    printf '  Run: make setup-dev / make setup-dev を実行してください\n' >&2
+    exit 1
+fi
+
+zero=$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')
+
+# Prints the lines a patch adds, without the leading "+". File headers are
+# skipped, so a "+++ b/path" line is never mistaken for content.
+added_lines() {
+    # The NUL bytes go first. The system awk ends a record at the first one,
+    # so everything after it in a binary line was dropped before the scan —
+    # which is most of what --text is here to expose. The scanner's own
+    # `$(cat)` drops them too, so nothing is lost by dropping them earlier.
+    tr -d '\000' | awk '
+        /^diff --git / { header = 1; next }
+        /^@@/ { header = 0; next }
+        !header && /^\+/ { print substr($0, 2) }
+    '
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # Deleting a remote ref publishes nothing.
+    [ "$local_sha" = "$zero" ] && continue
+
+    # A ref name is published as surely as its contents, and a branch or
+    # lightweight tag name reaches the remote without being part of any object.
+    # The name pushed to may differ from the local one, so scan both.
+    printf '%s\n%s\n' "$local_ref" "$remote_ref" | "$scan" 'ref names'
+
+    # An annotated tag is an object of its own. Its tagger and message are
+    # published with it and appear in no commit, so scan the tag — and any tag
+    # it points at — before following it to what it tags.
+    # Plain assignments, so that under set -e an object git cannot read stops
+    # the push instead of being skipped.
+    object=$local_sha
+    type=$(git cat-file -t "$object")
+    while [ "$type" = tag ]; do
+        git cat-file tag "$object" | "$scan" "tag object ($local_ref)"
+        object=$(git cat-file tag "$object" | sed -n '1s/^object //p')
+        type=$(git cat-file -t "$object")
+    done
+
+    if [ "$type" != commit ]; then
+        # A tag of a tree or a blob, or a ref pointing straight at one.
+        # `cat-file -p` on a tree prints its top level and nothing else, so a
+        # denied value one directory down would go unread. rev-list
+        # --objects takes a tree or a blob as its start point and names every
+        # object underneath it; the names and the blobs are scanned separately.
+        git -c core.quotePath=false rev-list --objects "$object" \
+            | sed -n 's/^[0-9a-f]* //p' \
+            | "$scan" "tagged names ($local_ref)"
+        git rev-list --objects "$object" \
+            | awk '{print $1}' \
+            | git cat-file --batch-check='%(objectname) %(objecttype)' \
+            | awk '$2 == "blob" { print $1 }' \
+            | git cat-file --batch \
+            | "$scan" "tagged content ($local_ref)"
+        continue
+    fi
+
+    if [ "$remote_sha" = "$zero" ] ||
+        ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+        # A new remote ref, or a remote tip this clone does not have: treat
+        # every commit reachable from what is pushed as new.
+        range=$object
+    else
+        range="$remote_sha..$object"
+    fi
+
+    git log --no-show-signature --format='%an <%ae>%n%cn <%ce>' "$range" \
+        | sort -u \
+        | "$scan" "commit identities ($local_ref)"
+
+    git log --no-show-signature --format='%B' "$range" \
+        | "$scan" "commit messages ($local_ref)"
+
+    # Each commit's own additions rather than the net diff of the range: a
+    # string added by one pushed commit and removed by a later one is still
+    # published by the first. -m diffs a merge against each parent, and --root
+    # shows the root commit's content even under log.showRoot=false. --text
+    # prints a diff for content git would otherwise summarise as "Binary files
+    # differ", and for anything marked `-diff` in .gitattributes; without it a
+    # denied value inside such a file yields no added lines to scan.
+    git log --no-show-signature -p -m --root --format= --text \
+        --no-color --no-ext-diff --no-textconv --unified=0 "$range" \
+        | added_lines \
+        | "$scan" "pushed additions ($local_ref)"
+
+    # T (type change) as well as ACMR: swapping a file for a symlink, or the
+    # reverse, is recorded as neither an addition nor a modification.
+    git -c core.quotePath=false log --no-show-signature -m --root --format= \
+        --name-only --diff-filter=ACMRT "$range" \
+        | sort -u \
+        | "$scan" "pushed file names ($local_ref)"
+done

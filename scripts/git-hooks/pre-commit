@@ -1,0 +1,100 @@
+#!/bin/sh
+# Block a commit that would record the wrong identity or private content.
+set -eu
+# Read bytes, not characters, like the scanner this feeds. In a UTF-8 locale
+# the system sed stops at the first line holding an invalid byte.
+LC_ALL=C
+export LC_ALL
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+scan=scripts/scan-private-content.sh
+# Fail closed. `make setup-dev` creates the hook path and the scanner together,
+# so a missing or non-executable scanner means this clone is not set up, not
+# that there is nothing to check.
+if [ ! -x "$scan" ]; then
+    printf 'BLOCKED the content scanner is missing or not executable: %s\n' "$scan" >&2
+    printf 'BLOCKED 検査スクリプトが無いか実行権限がありません: %s\n' "$scan" >&2
+    printf '  Run: make setup-dev / make setup-dev を実行してください\n' >&2
+    exit 1
+fi
+
+author_email=$(git var GIT_AUTHOR_IDENT | sed -n 's/^.*<\(.*\)>.*$/\1/p')
+committer_email=$(git var GIT_COMMITTER_IDENT | sed -n 's/^.*<\(.*\)>.*$/\1/p')
+expected_email=$(git config --get user.email || true)
+
+# A machine-local address is never meant for a public history, so it is refused
+# for everyone. Anything further is per-clone and adds to that, rather than
+# replacing it: set your own workplace domain with, for example
+#   git config audiolevelbar.blockedEmailSuffixes '.example.edu'
+# The value is the suffix itself. A leading `*`, written by analogy with the
+# `*.local` in the messages, is dropped so that it does not match nothing.
+# A domain belonging to one contributor does not belong in a shipped hook,
+# where it would lock out everybody else at that institution. Adding rather
+# than replacing means a clone that sets this cannot lose the `.local` rule by
+# forgetting to repeat it.
+blocked=".local $(git config --get audiolevelbar.blockedEmailSuffixes || true)"
+
+for email in "$author_email" "$committer_email"; do
+    if [ -z "$email" ]; then
+        printf 'BLOCKED empty commit identity.\n' >&2
+        printf 'BLOCKED コミットのidentityが空です。\n' >&2
+        printf '  Run: make setup-dev / make setup-dev を実行してください\n' >&2
+        exit 1
+    fi
+    for suffix in $blocked; do
+        suffix=${suffix#\*}
+        case "$email" in
+            *"$suffix")
+                printf 'BLOCKED this identity must not reach a public history: %s\n' "$email" >&2
+                printf 'BLOCKED このidentityは公開履歴に入れられません: %s\n' "$email" >&2
+                printf '  Set a publishable address, e.g. your GitHub noreply one.\n' >&2
+                printf '  公開可能なアドレス（GitHubのnoreply等）を設定してください。\n' >&2
+                exit 1
+                ;;
+        esac
+    done
+    if [ -n "$expected_email" ] && [ "$email" != "$expected_email" ]; then
+        printf 'BLOCKED identity does not match this clone: %s (expected %s)\n' \
+            "$email" "$expected_email" >&2
+        printf 'BLOCKED identityがこのcloneの設定と一致しません: %s (期待: %s)\n' \
+            "$email" "$expected_email" >&2
+        exit 1
+    fi
+done
+
+# Only what the commit adds is scanned. A diff also carries the lines it
+# removes, so scanning the whole diff would refuse precisely the commit that
+# takes a private string out. File headers are skipped, so "+++ b/path" is never
+# mistaken for content; file names are scanned on their own below.
+added_lines() {
+    # The NUL bytes go first. The system awk ends a record at the first one,
+    # so everything after it in a binary line was dropped before the scan —
+    # which is most of what --text is here to expose. The scanner's own
+    # `$(cat)` drops them too, so nothing is lost by dropping them earlier.
+    tr -d '\000' | awk '
+        /^diff --git / { header = 1; next }
+        /^@@/ { header = 0; next }
+        !header && /^\+/ { print substr($0, 2) }
+    '
+}
+
+# core.quotePath=false keeps non-ASCII file names literal, so a pattern
+# written in, say, Japanese can still match a name.
+#
+# T (type change) is in the filter as well as ACMR. Replacing a file with a
+# symlink, or a symlink with a file, is recorded as a type change and nothing
+# else, so a filter without it leaves both the name and the new content unread.
+#
+# --text makes git print a diff for content it would otherwise summarise as
+# "Binary files differ", and for anything marked `-diff` in .gitattributes.
+# Without it a denied value inside such a file yields no added lines at all.
+names=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMRT)
+if [ -n "$names" ]; then
+    printf '%s\n' "$names" | "$scan" 'staged file names'
+    git diff --cached --diff-filter=ACMRT --text \
+        --no-color --no-ext-diff --no-textconv --unified=0 \
+        | added_lines \
+        | "$scan" 'staged additions'
+fi

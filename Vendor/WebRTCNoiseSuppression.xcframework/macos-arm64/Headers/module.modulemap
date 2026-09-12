@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Yuhki Shiraishi
+//
+// This file belongs to Audio Level Bar, not to the upstream projects it is
+// built against. It sits beside them, but it is covered by the MIT License
+// in the repository root, not by the upstream licenses listed in
+// THIRD_PARTY_NOTICES.md.
+
+module WebRTCNoiseSuppression {
+    header "WebRTCNoiseSuppression.h"
+    export *
+}

@@ -1,0 +1,17 @@
+.DS_Store
+/.claude/
+/.local/
+
+# Working notes stay on the machine that wrote them. A published work log is
+# not retractable, and these files accumulate machine names, absolute paths,
+# and third-party names that have no business in a public repository.
+/WORKLOG.md
+/AGENTS.local.md
+/CLAUDE.local.md
+/NOTES.md
+/TODO.local.md
+/.build/
+/dist/
+/.swiftpm/
+xcuserdata/
+*.xcuserstate

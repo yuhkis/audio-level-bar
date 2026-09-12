@@ -1,0 +1,2 @@
+"NSMicrophoneUsageDescription" = "Audio Level Bar uses the microphone to show your input level, and, only while you have the processed microphone turned on, to send processed audio to a virtual input on this Mac. It does not record, store, or transmit audio.";
+"NSAudioCaptureUsageDescription" = "Audio Level Bar uses system audio recording only while you have system playback level monitoring turned on, or while it publishes the processed microphone as a virtual input on this Mac. It does not record, store, or transmit audio.";

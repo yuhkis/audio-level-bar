@@ -1,0 +1,2 @@
+"NSMicrophoneUsageDescription" = "マイク入力レベルの表示と、明示的に有効にした加工済みマイクをこのMac内の仮想入力へ転送するために、マイクを使用します。Audio Level Barは音声を録音・保存せず、ネットワークへ送信しません。";
+"NSAudioCaptureUsageDescription" = "明示的に有効にしたシステム再生レベルの監視と、加工済みマイクをこのMac内の仮想入力として公開するために、システムオーディオ録音を使用します。Audio Level Barは音声を録音・保存せず、ネットワークへ送信しません。";

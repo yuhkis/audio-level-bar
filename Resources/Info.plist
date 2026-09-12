@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AudioLevelBarGitCommit</key>
+	<string>unknown</string>
+	<key>AudioLevelBarGitState</key>
+	<string>source</string>
+	<key>AudioLevelBarProvenanceTimestamp</key>
+	<string>unknown</string>
+	<key>AudioLevelBarSourceFingerprint</key>
+	<string>unknown</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Audio Level Bar</string>
+	<key>CFBundleExecutable</key>
+	<string>AudioLevelBar</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.yuhkis.audio-level-bar</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Audio Level Bar</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.4.0</string>
+	<key>CFBundleVersion</key>
+	<string>54</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.2</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Audio Level Bar uses system audio recording only while you have system playback level monitoring turned on, or while it publishes the processed microphone as a virtual input on this Mac. It does not record, store, or transmit audio.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Audio Level Bar uses the microphone to show your input level, and, only while you have the processed microphone turned on, to send processed audio to a virtual input on this Mac. It does not record, store, or transmit audio.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+</dict>
+</plist>
