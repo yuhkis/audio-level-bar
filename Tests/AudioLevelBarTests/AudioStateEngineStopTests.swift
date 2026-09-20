@@ -425,18 +425,25 @@ final class AudioStateEngineStopTests: XCTestCase {
         XCTAssertEqual(harness.state.microphoneProcessingMode, .webRTCLow, "not a failure of the mode")
         XCTAssertNil(harness.state.microphoneProcessingMessage)
         XCTAssertEqual(harness.state.processedMicrophoneState, .starting)
-        let kept = harness.hal.calls.count
+        let capturePrefix = "processed-microphone-capture-ioproc "
+        let keptCaptureLines = harness.lines(withPrefix: capturePrefix).count
 
         passWindow(harness)
         for _ in 0..<4 where harness.state.processedMicrophoneState != .active {
             passWindow(harness)
         }
 
-        let released = harness.lifecycleCalls(after: kept)
+        // The ordinary meter resumes on a different lifecycle queue and
+        // may create its IOProc first. Check the capture's own release and
+        // restart order without imposing an order between those queues.
+        let released = Array(harness.lines(withPrefix: capturePrefix).dropFirst(keptCaptureLines))
+        let operations = released.filter { $0.contains("-begin ") }.map {
+            String($0.split(separator: " ")[1])
+        }
         XCTAssertEqual(
-            Array(released.prefix(1)),
-            [.destroyIOProc(microphone)],
-            "the release after the window destroys the unstarted IOProc first: \(released)"
+            operations,
+            ["destroy-begin", "create-begin", "start-begin"],
+            "the kept, unstarted capture is destroyed before its replacement is created and started: \(released)"
         )
         XCTAssertEqual(harness.publisherEngines.engines.count, 2, "and starts again")
         XCTAssertEqual(harness.state.microphoneProcessingMode, .webRTCLow)
