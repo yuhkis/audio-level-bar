@@ -178,7 +178,8 @@ struct PopoverView: View {
                 meterColorSettings: meterColorSettings,
                 inputVolume: state.inputVolume,
                 showsProcessedSource: state.processedMicrophoneState == .active,
-                inputIsMuted: state.inputMuted == true
+                inputIsMuted: state.inputMuted == true,
+                isMeasuring: state.microphoneLevelIsLive
             )
 
             VStack(alignment: .leading, spacing: 4) {
@@ -212,9 +213,29 @@ struct PopoverView: View {
             }
 
             if let error = state.microphoneError {
-                Text(error)
+                HStack {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    Spacer()
+                    // Only once the meter gave up on the input. Until then it
+                    // retries by itself, and a stall is not the meter's to
+                    // retry: nothing is issued behind a call that has not
+                    // come back.
+                    if state.microphoneMeterGaveUp {
+                        Button(localized("Retry")) {
+                            state.retryMicrophoneMeter()
+                        }
+                        .controlSize(.small)
+                    }
+                }
+            } else if state.showsBluetoothInputNote {
+                // In place of "Monitoring the microphone level", which would
+                // contradict the -- above it.
+                Text(localized("The microphone level is not measured while the default input is a Bluetooth microphone, or an aggregate device that includes a Bluetooth device or a device that is not available. Opening it could switch a headset into call mode and lower playback quality."))
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 HStack {
                     Text(state.microphonePermission.description)
@@ -228,13 +249,6 @@ struct PopoverView: View {
                         .controlSize(.small)
                     }
                 }
-            }
-
-            if state.showsBluetoothMonitoringNote {
-                Text(localized("This Bluetooth microphone is metered only while this popup or the control window is open, because opening it switches the headset into call mode and lowers playback quality. While both are closed, the menu bar shows --. “Always monitor Bluetooth microphones” in Settings changes this."))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Divider()
@@ -353,8 +367,6 @@ struct PopoverView: View {
         VStack(alignment: .leading, spacing: 12) {
             systemOutputMonitoringSettings
             Divider()
-            microphoneMonitoringSettings
-            Divider()
             meterColorSection
         }
     }
@@ -396,23 +408,6 @@ struct PopoverView: View {
                     .controlSize(.small)
                 }
             }
-        }
-    }
-
-    private var microphoneMonitoringSettings: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label(localized("Microphone monitoring"), systemImage: "mic.fill")
-                .font(.headline)
-
-            Toggle(
-                localized("Always monitor Bluetooth microphones"),
-                isOn: bluetoothAlwaysMonitorBinding
-            )
-
-            Text(localized("Opening a Bluetooth microphone switches the headset into call mode and lowers playback quality for as long as it stays open. When this is off, a Bluetooth default input is metered only while this popup or the control window is showing, and the menu bar shows -- the rest of the time. Other microphones, and any input while the processed microphone is on, are always metered."))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -621,13 +616,6 @@ struct PopoverView: View {
         )
     }
 
-    private var bluetoothAlwaysMonitorBinding: Binding<Bool> {
-        Binding(
-            get: { state.bluetoothMicrophoneAlwaysMonitored },
-            set: state.setBluetoothMicrophoneAlwaysMonitored
-        )
-    }
-
     private var systemOutputMonitoringBinding: Binding<Bool> {
         Binding(
             get: { state.systemOutputMonitoringEnabled },
@@ -650,9 +638,10 @@ struct PopoverView: View {
             return .green
         case .microphoneDenied, .systemAudioDenied, .failed:
             return .red
-        case .awaitingRelease:
-            // Nothing is broken, but the switch the user just moved has not
-            // taken effect yet, so it should not read as a settled state.
+        case .awaitingRelease, .refused:
+            // Nothing is broken, but the switch the user moved has not taken
+            // effect, so it should not read as a settled state. A refusal
+            // clears by itself once the default device changes; no Retry.
             return .orange
         default:
             return .secondary
@@ -889,31 +878,48 @@ private struct MicrophoneMeterView: View {
     let inputVolume: Float?
     let showsProcessedSource: Bool
     let inputIsMuted: Bool
+    /// False while nothing is measured — a Bluetooth input, a start in
+    /// progress, no permission. The meter then shows `--`, never −∞.
+    let isMeasuring: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             LargeLevelMeter(
-                value: MeterScale.normalized(
-                    decibels: levels.microphone.rmsDecibels
-                ),
-                tint: levelTint(
-                    for: MeterScale.normalized(
-                        decibels: levels.microphone.rmsDecibels
-                    ),
-                    in: .microphone,
-                    settings: meterColorSettings
-                ),
-                primaryText: decibelText(levels.microphone.rmsDecibels),
+                value: meterValue,
+                tint: meterTint,
+                primaryText: meterText,
                 accessibilityLabelText: accessibilityLabel,
                 markerValue: inputVolume,
                 isMuted: inputIsMuted
             )
 
-            peakRow(
-                text: decibelText(levels.microphone.peakDecibels),
-                isMuted: inputIsMuted
-            )
+            peakRow(text: peakText, isMuted: inputIsMuted)
         }
+    }
+
+    private var meterValue: Float {
+        isMeasuring
+            ? MeterScale.normalized(decibels: levels.microphone.rmsDecibels)
+            : 0
+    }
+
+    private var meterTint: Color {
+        guard isMeasuring else {
+            return .gray
+        }
+        return levelTint(
+            for: MeterScale.normalized(decibels: levels.microphone.rmsDecibels),
+            in: .microphone,
+            settings: meterColorSettings
+        )
+    }
+
+    private var meterText: String {
+        isMeasuring ? decibelText(levels.microphone.rmsDecibels) : "-- dBFS"
+    }
+
+    private var peakText: String {
+        isMeasuring ? decibelText(levels.microphone.peakDecibels) : "-- dBFS"
     }
 
     private var accessibilityLabel: String {

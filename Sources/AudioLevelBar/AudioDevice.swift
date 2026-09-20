@@ -8,7 +8,32 @@ struct AudioDevice: Identifiable, Hashable {
     let uid: String
     let inputChannelCount: Int
     let outputChannelCount: Int
-    let transport: AudioDeviceTransport
+    /// The transport as read, or nil when the read failed. Decisions that
+    /// must not mistake a failed read for a transport, such as the publisher
+    /// output's, use this.
+    let readTransport: AudioDeviceTransport?
+
+    init(
+        id: AudioDeviceID,
+        name: String,
+        uid: String,
+        inputChannelCount: Int,
+        outputChannelCount: Int,
+        transport: AudioDeviceTransport?
+    ) {
+        self.id = id
+        self.name = name
+        self.uid = uid
+        self.inputChannelCount = inputChannelCount
+        self.outputChannelCount = outputChannelCount
+        readTransport = transport
+    }
+
+    /// The transport for the device lists, where an unreadable one only
+    /// picks an icon: `.unknown` when it was not read.
+    var transport: AudioDeviceTransport {
+        readTransport ?? .unknown
+    }
 
     var hasInput: Bool {
         inputChannelCount > 0

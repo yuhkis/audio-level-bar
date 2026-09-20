@@ -14,6 +14,14 @@ enum CoreAudioSystemError: LocalizedError {
     }
 }
 
+/// What an IOProc on a device's input receives.
+struct InputStreamFormat: Equatable {
+    let sampleFormat: PCMSampleFormat
+    /// Channels summed over every input stream.
+    let channelCount: Int
+    let sampleRate: Double
+}
+
 final class CoreAudioSystem {
     private let systemObject = AudioObjectID(kAudioObjectSystemObject)
 
@@ -47,7 +55,15 @@ final class CoreAudioSystem {
     private static let controlLayoutCacheLifetimeSeconds: Double = 30
 
     func devices(for direction: AudioDirection) -> [AudioDevice] {
-        allDeviceIDs()
+        listedDevices(for: direction) ?? []
+    }
+
+    /// The devices `devices(for:)` lists, or nil when the device list itself
+    /// could not be read. The processed microphone's publisher engine chooses
+    /// its output from this, read uncached, by the same criteria the device
+    /// pickers use.
+    func listedDevices(for direction: AudioDirection) -> [AudioDevice]? {
+        deviceIDs()?
             .compactMap(audioDevice)
             .filter { device in
                 let hasChannels = direction == .input
@@ -92,7 +108,8 @@ final class CoreAudioSystem {
     }
 
     @discardableResult
-    func setDefaultDevice(_ deviceID: AudioDeviceID, for direction: AudioDirection) -> Bool {
+    /// - Returns: The status of the write.
+    func setDefaultDevice(_ deviceID: AudioDeviceID, for direction: AudioDirection) -> OSStatus {
         var address = AudioObjectPropertyAddress(
             mSelector: direction.defaultDeviceSelector,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -108,7 +125,7 @@ final class CoreAudioSystem {
             size,
             &mutableDeviceID
         )
-        return status == noErr
+        return status
     }
 
     func controls(for deviceID: AudioDeviceID, direction: AudioDirection) -> AudioControlSnapshot {
@@ -150,11 +167,16 @@ final class CoreAudioSystem {
     }
 
     @discardableResult
+    /// Writes every settable volume element of the direction.
+    ///
+    /// - Returns: The first status other than `noErr` among the writes,
+    ///   `kAudioHardwareUnknownPropertyError` when no element is settable, or
+    ///   `noErr`.
     func setVolume(
         _ volume: Float,
         deviceID: AudioDeviceID,
         direction: AudioDirection
-    ) -> Bool {
+    ) -> OSStatus {
         let clamped = min(max(volume, 0), 1)
         let addresses = settablePropertyAddresses(
             selector: kAudioDevicePropertyVolumeScalar,
@@ -163,10 +185,10 @@ final class CoreAudioSystem {
         )
 
         guard !addresses.isEmpty else {
-            return false
+            return kAudioHardwareUnknownPropertyError
         }
 
-        return addresses.reduce(true) { result, address in
+        return addresses.reduce(noErr) { result, address in
             var address = address
             var mutableValue = clamped
             let status = AudioObjectSetPropertyData(
@@ -177,16 +199,21 @@ final class CoreAudioSystem {
                 UInt32(MemoryLayout<Float32>.size),
                 &mutableValue
             )
-            return result && status == noErr
+            return result != noErr ? result : status
         }
     }
 
     @discardableResult
+    /// Writes every settable mute element of the direction.
+    ///
+    /// - Returns: The first status other than `noErr` among the writes,
+    ///   `kAudioHardwareUnknownPropertyError` when no element is settable, or
+    ///   `noErr`.
     func setMuted(
         _ muted: Bool,
         deviceID: AudioDeviceID,
         direction: AudioDirection
-    ) -> Bool {
+    ) -> OSStatus {
         let addresses = settablePropertyAddresses(
             selector: kAudioDevicePropertyMute,
             deviceID: deviceID,
@@ -194,10 +221,10 @@ final class CoreAudioSystem {
         )
 
         guard !addresses.isEmpty else {
-            return false
+            return kAudioHardwareUnknownPropertyError
         }
 
-        return addresses.reduce(true) { result, address in
+        return addresses.reduce(noErr) { result, address in
             var address = address
             var mutableValue: UInt32 = muted ? 1 : 0
             let status = AudioObjectSetPropertyData(
@@ -208,36 +235,242 @@ final class CoreAudioSystem {
                 UInt32(MemoryLayout<UInt32>.size),
                 &mutableValue
             )
-            return result && status == noErr
+            return result != noErr ? result : status
         }
     }
 
-    private func allDeviceIDs() -> [AudioDeviceID] {
+    /// Every device the HAL lists, or nil when the list could not be read.
+    /// An empty array is a successful read of no devices, which a caller that
+    /// tracks arrivals and departures must not confuse with a failed one.
+    func deviceIDs() -> [AudioDeviceID]? {
+        guard let deviceIDs = objectIDList(
+            of: systemObject,
+            selector: kAudioHardwarePropertyDevices,
+            scope: kAudioObjectPropertyScopeGlobal
+        ) else {
+            return nil
+        }
+        // A device arriving or leaving can also renumber the survivors, and an
+        // AudioDeviceID is reusable, so a cached layout could end up describing
+        // different hardware. Drop the cache rather than reason about which
+        // entries stayed valid.
+        noteCurrentDeviceIDs(deviceIDs)
+        return deviceIDs
+    }
+
+    /// The sub-devices currently active in an aggregate, in the order Core
+    /// Audio lists them, or nil when the list could not be read.
+    func activeSubDeviceIDs(of aggregateID: AudioDeviceID) -> [AudioDeviceID]? {
+        objectIDList(
+            of: aggregateID,
+            selector: kAudioAggregateDevicePropertyActiveSubDeviceList,
+            scope: kAudioObjectPropertyScopeGlobal
+        )
+    }
+
+    /// Every sub-device an aggregate names, active or not
+    /// (`kAudioAggregateDevicePropertyFullSubDeviceList`), in the order Core
+    /// Audio lists them, each resolved from its UID to the device that has it
+    /// now. A UID no device has, as for a headset that is not connected, or
+    /// one that could not be translated, is nil. nil when the list could not
+    /// be read.
+    func fullSubDeviceIDs(of aggregateID: AudioDeviceID) -> [AudioDeviceID?]? {
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDevices,
+            mSelector: kAudioAggregateDevicePropertyFullSubDeviceList,
             mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: Unmanaged<CFArray>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFArray>?>.size)
+        let status = AudioObjectGetPropertyData(aggregateID, &address, 0, nil, &size, &value)
+        guard status == noErr, let value else {
+            return nil
+        }
+        let uids = value.takeRetainedValue() as NSArray
+        return uids.map { element in
+            (element as? String).flatMap(deviceID(forUID:))
+        }
+    }
+
+    /// `kAudioHardwarePropertyTranslateUIDToDevice`: the device that has the
+    /// UID now, or nil when none has or the read failed.
+    private func deviceID(forUID uid: String) -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var qualifier = uid as CFString
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = withUnsafeMutablePointer(to: &qualifier) { pointer in
+            AudioObjectGetPropertyData(
+                systemObject,
+                &address,
+                UInt32(MemoryLayout<CFString>.size),
+                pointer,
+                &size,
+                &deviceID
+            )
+        }
+        guard status == noErr, deviceID != kAudioObjectUnknown else {
+            return nil
+        }
+        return deviceID
+    }
+
+    /// Reads the transport of exactly this device and, for an aggregate, the
+    /// transports of its active sub-devices and of its full composition,
+    /// nested aggregates included. Nothing is cached, which is what
+    /// the meter's lifecycle queue needs immediately before it opens a device.
+    /// nil when the device's own transport could not be read, so that a
+    /// failed read is never mistaken for a transport that rules Bluetooth out.
+    func transportInfo(for deviceID: AudioDeviceID) -> AudioDeviceTransportInfo? {
+        transportInfo(for: deviceID) { readTransport(deviceID: $0) }
+    }
+
+    /// The same, with the per-device transport read supplied by the caller,
+    /// so the HAL worker can answer it from its cache. The sub-device lists of
+    /// an aggregate, and the translation of its members' UIDs, are always
+    /// read, because they change while the ID stays.
+    /// See `AudioDeviceTransportInfo.read` for how failed reads count.
+    func transportInfo(
+        for deviceID: AudioDeviceID,
+        transportOf: (AudioDeviceID) -> AudioDeviceTransport?
+    ) -> AudioDeviceTransportInfo? {
+        AudioDeviceTransportInfo.read(
+            deviceID: deviceID,
+            transportOf: transportOf,
+            activeSubDevicesOf: { activeSubDeviceIDs(of: $0) },
+            fullSubDevicesOf: { fullSubDeviceIDs(of: $0) }
+        )
+    }
+
+    /// The format the device's input streams deliver to an IOProc, or nil
+    /// when the device has no input stream, a stream's format cannot be read,
+    /// the streams are not all the same native-endian float format, or a
+    /// stream reports a sample rate `SampleRatePolicy` does not accept.
+    ///
+    /// An IOProc receives each stream in its virtual format. `channelCount`
+    /// is the total over every input stream, which is how many samples per
+    /// frame the level math sees across the buffer list.
+    func inputStreamFormat(for deviceID: AudioDeviceID) -> InputStreamFormat? {
+        guard
+            let streamIDs = objectIDList(
+                of: deviceID,
+                selector: kAudioDevicePropertyStreams,
+                scope: kAudioDevicePropertyScopeInput
+            ),
+            !streamIDs.isEmpty
+        else {
+            return nil
+        }
+
+        var sampleFormat: PCMSampleFormat?
+        var sampleRate: Double = 0
+        var channelCount = 0
+        for streamID in streamIDs {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioStreamPropertyVirtualFormat,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var description = AudioStreamBasicDescription()
+            var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+            guard
+                AudioObjectGetPropertyData(
+                    streamID,
+                    &address,
+                    0,
+                    nil,
+                    &size,
+                    &description
+                ) == noErr,
+                let streamFormat = PCMSampleFormat(description),
+                description.mChannelsPerFrame > 0,
+                SampleRatePolicy.isUsable(description.mSampleRate)
+            else {
+                return nil
+            }
+            if let sampleFormat, sampleFormat != streamFormat {
+                return nil
+            }
+            sampleFormat = streamFormat
+            if sampleRate == 0 {
+                sampleRate = description.mSampleRate
+            }
+            channelCount += Int(description.mChannelsPerFrame)
+        }
+
+        guard let sampleFormat else {
+            return nil
+        }
+        return InputStreamFormat(
+            sampleFormat: sampleFormat,
+            channelCount: channelCount,
+            sampleRate: sampleRate
+        )
+    }
+
+    /// The largest IO buffer, in frames, the device may hand an IOProc, from
+    /// `kAudioDevicePropertyBufferFrameSizeRange`. nil when it could not be
+    /// read. A capture sizes the scratch storage its IOProc copies into from
+    /// this, before it starts, so the IO thread never allocates.
+    func maximumBufferFrameSize(for deviceID: AudioDeviceID) -> Int? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSizeRange,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var range = AudioValueRange()
+        var size = UInt32(MemoryLayout<AudioValueRange>.size)
+        guard
+            AudioObjectGetPropertyData(
+                deviceID,
+                &address,
+                0,
+                nil,
+                &size,
+                &range
+            ) == noErr,
+            range.mMaximum.isFinite,
+            range.mMaximum >= 1
+        else {
+            return nil
+        }
+        return Int(min(range.mMaximum, Double(Int32.max)))
+    }
+
+    private func objectIDList(
+        of objectID: AudioObjectID,
+        selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope
+    ) -> [AudioObjectID]? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
             mElement: kAudioObjectPropertyElementMain
         )
         var size: UInt32 = 0
 
         guard AudioObjectGetPropertyDataSize(
-            systemObject,
+            objectID,
             &address,
             0,
             nil,
             &size
         ) == noErr else {
-            return []
+            return nil
         }
 
-        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
         guard count > 0 else {
             return []
         }
-        var deviceIDs = [AudioDeviceID](repeating: 0, count: count)
-        let status = deviceIDs.withUnsafeMutableBytes { bytes in
+        var objectIDs = [AudioObjectID](repeating: 0, count: count)
+        let status = objectIDs.withUnsafeMutableBytes { bytes in
             AudioObjectGetPropertyData(
-                systemObject,
+                objectID,
                 &address,
                 0,
                 nil,
@@ -247,14 +480,11 @@ final class CoreAudioSystem {
         }
 
         guard status == noErr else {
-            return []
+            return nil
         }
-        // A device arriving or leaving can also renumber the survivors, and an
-        // AudioDeviceID is reusable, so a cached layout could end up describing
-        // different hardware. Drop the cache rather than reason about which
-        // entries stayed valid.
-        noteCurrentDeviceIDs(deviceIDs)
-        return deviceIDs
+        // The list can shrink between the size and the data read.
+        let readCount = Int(size) / MemoryLayout<AudioObjectID>.size
+        return Array(objectIDs.prefix(readCount))
     }
 
     private func audioDevice(_ deviceID: AudioDeviceID) -> AudioDevice? {
@@ -275,7 +505,9 @@ final class CoreAudioSystem {
             deviceID: deviceID,
             scope: kAudioDevicePropertyScopeOutput
         )
-        let transport = deviceTransport(deviceID: deviceID)
+        // nil when unread: the device lists show `.unknown` for it, and the
+        // publisher output waits for a read rather than refusing it.
+        let transport = readTransport(deviceID: deviceID)
 
         guard inputChannelCount > 0 || outputChannelCount > 0 else {
             return nil
@@ -310,55 +542,22 @@ final class CoreAudioSystem {
         return value != 0
     }
 
-    /// Transport of one device, for callers outside the device-list path.
-    /// The Bluetooth microphone pause needs it per poll, not per list refresh.
-    func transport(for deviceID: AudioDeviceID) -> AudioDeviceTransport {
-        deviceTransport(deviceID: deviceID)
+    /// Transport of one device, for callers outside the device-list path, or
+    /// nil when it could not be read.
+    func transport(for deviceID: AudioDeviceID) -> AudioDeviceTransport? {
+        readTransport(deviceID: deviceID)
     }
 
-    private func deviceTransport(deviceID: AudioDeviceID) -> AudioDeviceTransport {
+    private func readTransport(deviceID: AudioDeviceID) -> AudioDeviceTransport? {
         let address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyTransportType,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
         guard let rawValue = readUInt32(deviceID: deviceID, address: address) else {
-            return .unknown
+            return nil
         }
-
-        switch rawValue {
-        case kAudioDeviceTransportTypeBuiltIn:
-            return .builtIn
-        case kAudioDeviceTransportTypeAggregate:
-            return .aggregate
-        case kAudioDeviceTransportTypeVirtual:
-            return .virtual
-        case kAudioDeviceTransportTypePCI:
-            return .pci
-        case kAudioDeviceTransportTypeUSB:
-            return .usb
-        case kAudioDeviceTransportTypeFireWire:
-            return .fireWire
-        case kAudioDeviceTransportTypeBluetooth:
-            return .bluetooth
-        case kAudioDeviceTransportTypeBluetoothLE:
-            return .bluetoothLE
-        case kAudioDeviceTransportTypeHDMI:
-            return .hdmi
-        case kAudioDeviceTransportTypeDisplayPort:
-            return .displayPort
-        case kAudioDeviceTransportTypeAirPlay:
-            return .airPlay
-        case kAudioDeviceTransportTypeAVB:
-            return .avb
-        case kAudioDeviceTransportTypeThunderbolt:
-            return .thunderbolt
-        case kAudioDeviceTransportTypeContinuityCaptureWired,
-                kAudioDeviceTransportTypeContinuityCaptureWireless:
-            return .continuityCapture
-        default:
-            return .unknown
-        }
+        return AudioDeviceTransport(transportType: rawValue)
     }
 
     private func stringProperty(
@@ -494,6 +693,15 @@ final class CoreAudioSystem {
 
     /// Drops every cached layout. Called when the device set changes, since an
     /// `AudioDeviceID` can be reused by different hardware.
+    /// Drops every cached control layout and the device set it was learned
+    /// for. coreaudiod restarted, and a device ID may now name other hardware.
+    func forgetControlLayoutCache() {
+        cacheLock.lock()
+        lastSeenDeviceIDs = []
+        cacheLock.unlock()
+        invalidateControlLayoutCache()
+    }
+
     private func invalidateControlLayoutCache() {
         cacheLock.lock()
         controlLayoutCache.removeAll(keepingCapacity: true)

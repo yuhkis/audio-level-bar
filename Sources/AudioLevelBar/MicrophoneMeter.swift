@@ -1,455 +1,865 @@
-import AVFoundation
 import AudioLevelBarCore
+import CoreAudio
 import Foundation
-import ObjCExceptionShim
+import os
 
-/// Watches the default input and reports RMS and peak levels.
+enum MicrophoneMeterError: LocalizedError, Equatable {
+    case unsupportedFormat
+    case operationFailed(String, OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedFormat:
+            return localized("The microphone audio format could not be read.")
+        case let .operationFailed(operation, status):
+            return localized("%1$@ failed (Core Audio status %2$d).", operation, status)
+        }
+    }
+}
+
+/// Meters one explicitly chosen input device through a HAL IOProc.
 ///
-/// Every engine operation runs on a serial lifecycle queue rather than the
-/// caller's thread. `AVAudioEngine.inputNode` opens the current default input
-/// through the HAL, and a device that is slow to answer — a Continuity
-/// microphone on an iPhone that has to wake and connect, most reliably — leaves
-/// that call spinning inside AVFAudio. Called from the main thread, as it was,
-/// that spin freezes the menu, the panel, and Quit, which is what pushes a user
-/// into force quitting. Serializing here keeps the wait where it belongs.
+/// The meter is bound to the AudioDeviceID it was started with and never
+/// follows the default input by itself. A framework engine that follows the
+/// default does so on its own: when a Bluetooth headset arrives it moves the
+/// running IO onto the headset's microphone before the app can react, which
+/// puts the headset into call mode, and a framework-issued restart of that IO
+/// while the headset's input reconfigures can leave coreaudiod waiting for
+/// every process. Here nothing moves unless the owner starts the meter on
+/// another device.
 ///
-/// `start()`, `restart()`, and `stop()` must be called from the main thread.
-/// Only the scheduled-restart bookkeeping requires it; everything touching the
-/// engine is confined to the lifecycle queue.
+/// Three queues, each with one job:
+/// - `lifecycleQueue` re-reads the exact device's transport, reads its format,
+///   and creates, starts, stops and destroys the IOProc and its listeners.
+///   `AudioDeviceStart` can wait in coreaudiod for an unbounded time, and a
+///   wait there costs this queue and nothing else.
+/// - `processingQueue` runs the IOProc block and accumulates about 100 ms of
+///   samples per level.
+/// - `listenerQueue` runs the property listeners. They only close the
+///   session's report gate and tell the owner; they never call a HAL lifecycle
+///   function. The owner decides a restart on its next evaluation.
+///
+/// `start(deviceID:)` and `stop(completion:)` must be called from the main
+/// thread. Events and levels are delivered on the main thread, only for the
+/// current session.
 final class MicrophoneMeter {
-    var onLevel: ((Float, Float) -> Void)?
-    var onError: ((String) -> Void)?
+    enum Event: Equatable {
+        /// The IOProc is running on the device.
+        case started(AudioDeviceID)
+        /// Nothing is left running on the device.
+        case failed(AudioDeviceID, MicrophoneMeterError)
+        /// The re-read transport ruled the device out; nothing was created.
+        case refused(AudioDeviceID, InputOpenRefusal)
+        /// The device died or changed its format under the running meter. Its
+        /// levels are no longer reported; the resources stay until the owner
+        /// starts or stops the meter again.
+        case invalidated(AudioDeviceID)
+        /// A quiet window armed after the start was issued, and the meter
+        /// stopped before its next HAL call. Whatever the start created, and
+        /// whatever the meter held before it, stays until the owner starts or
+        /// stops the meter again.
+        case interrupted(AudioDeviceID)
+        /// A quiet window armed after the stop was issued, and the meter kept
+        /// what it held rather than stop it inside the window. Its levels are
+        /// no longer reported; it stays until the owner starts or stops the
+        /// meter again.
+        case stopInterrupted
+    }
 
-    private let lifecycleQueue = DispatchQueue(
+    /// What became of a stop, for a caller that waits for the device to be
+    /// released.
+    enum StopOutcome: Equatable {
+        /// Nothing is left open on the device.
+        case stopped
+        /// A quiet window armed after the stop was issued. What the meter held
+        /// stays until the next start or stop after the window.
+        case interrupted
+        /// A newer start or stop took over before this one ran.
+        case superseded
+    }
+
+    var onLevel: ((Float, Float) -> Void)?
+    var onEvent: ((Event) -> Void)?
+
+    private static let invalidatingProperties: [AudioObjectPropertyAddress] = [
+        AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        ),
+        AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        ),
+        AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    ]
+
+    private let halCalls: any HALLifecycleCalls
+    private let holdGeneration: LifecycleHoldGeneration
+    /// Internal rather than private so a test can suspend it or wait for it.
+    let lifecycleQueue = DispatchQueue(
         label: "io.github.yuhkis.audio-level-bar.microphone-meter.lifecycle",
+        qos: .userInitiated
+    )
+    private let processingQueue = DispatchQueue(
+        label: "io.github.yuhkis.audio-level-bar.microphone-meter",
+        qos: .userInteractive
+    )
+    private let listenerQueue = DispatchQueue(
+        label: "io.github.yuhkis.audio-level-bar.microphone-meter.listener",
         qos: .userInitiated
     )
     private let sessionLock = NSLock()
     private var sessionID = UUID()
+    /// Guarded by `sessionLock`. The capture of the IOProc last created,
+    /// reachable from the main thread at Quit.
+    private weak var liveCapture: CaptureContext?
 
-    /// Queue-confined: only ever touched inside `lifecycleQueue`.
-    private var engine: AVAudioEngine?
-    private var configurationObserver: NSObjectProtocol?
-    /// Queue-confined. The engine release a suspend deferred; see
-    /// `scheduleEngineRelease()`.
-    private var pendingEngineRelease: DispatchWorkItem?
-
-    /// Main-confined.
-    private var scheduledRestart: DispatchWorkItem?
-    /// Main-confined. False between suspend()/stop() and the next start().
-    /// The configuration-change observer delivers on the main queue, and a
-    /// block already enqueued there survives removeObserver — so cancelling
-    /// the scheduled restart is not enough: the late block would schedule a
-    /// new one, and start() mints a fresh session that no invalidation can
-    /// veto. The revived meter would reopen the very input the caller just
-    /// released. Disarming here, on the same thread the block runs on, is
-    /// what actually closes that door.
-    private var restartsArmed = false
-    /// Main-confined. Consecutive shim-caught start failures. The retry loop
-    /// re-reads the settled format 0.75 s later, but a permanently hostile
-    /// device would otherwise retry forever, and every caught raise leaks a
-    /// little (the exception object, and the tap closure context the foreign
-    /// unwind never cleans up). External triggers — a device change, a panel
-    /// opening — still get their attempt regardless; success resets this.
-    private var shimRetryCount = 0
-
-    func start() {
-        start(completion: nil)
+    /// What one session created on one device.
+    private struct Resources {
+        let deviceID: AudioDeviceID
+        /// The transport class as last read, for the log lines.
+        var transport: String
+        let capture: CaptureContext
+        let ioProcID: AudioDeviceIOProcID
+        var listenerBlock: AudioObjectPropertyListenerBlock?
+        var listenedProperties: [AudioObjectPropertyAddress] = []
+        var ioProc: LifecycleTeardown.IOProc = .created
     }
 
-    private func start(completion: (() -> Void)?) {
-        restartsArmed = true
-        let session = replaceSession()
-        cancelScheduledRestart()
+    /// What became of a release of the resources.
+    private enum Release: Equatable {
+        case released
+        /// A quiet window armed after the release was issued. What it had
+        /// not yet stopped or destroyed stays in `resources`.
+        case interrupted
+    }
 
+    /// Lifecycle-queue confined.
+    private var resources: Resources?
+
+    init(halCalls: any HALLifecycleCalls, holdGeneration: LifecycleHoldGeneration) {
+        self.halCalls = halCalls
+        self.holdGeneration = holdGeneration
+    }
+
+    /// Opens `deviceID` and meters it, replacing whatever the meter held.
+    ///
+    /// The owner issues a start only outside the quiet window, but the
+    /// lifecycle queue can reach it later, behind a HAL call that is taking
+    /// its time. The start takes the window's generation now and compares it
+    /// before each call that releases the previous meter, before it creates
+    /// the IOProc, and immediately before `AudioDeviceStart`. A window that
+    /// armed in between ends the start there, with `.interrupted`.
+    ///
+    /// - Parameter issuedToken: The generation the owner's evaluation admitted
+    ///   the start under. An advance that lands after that evaluation read
+    ///   its admission then fails the first check. nil takes the current one.
+    func start(deviceID: AudioDeviceID, holdToken issuedToken: UInt64? = nil) {
+        let session = replaceSession()
+        let holdToken = issuedToken ?? holdGeneration.current
         lifecycleQueue.async { [self] in
-            // Always fires, including when a newer start superseded this one.
-            // The caller is waiting on the queue having finished, not on this
-            // particular session winning, and a completion that can silently
-            // never run strands whatever depends on it.
-            defer {
-                if let completion {
-                    DispatchQueue.main.async(execute: completion)
-                }
-            }
-            quiesceEngine()
+            // A newer start or stop releases what the meter holds when its
+            // turn comes.
             guard isCurrentSession(session) else {
                 return
             }
-            startEngine(session: session)
-        }
-    }
-
-    func restart() {
-        start(completion: nil)
-    }
-
-    /// Restarts and calls `completion` on the main thread once the engine has
-    /// been brought up, or has failed to.
-    ///
-    /// The processed microphone needs this: publishing its device translates
-    /// this process's pid to a Core Audio process object, and that only exists
-    /// once something here has opened audio. Running the meter first is what
-    /// opens it, and `start()` is asynchronous, so a caller that depends on the
-    /// object waits for this completion rather than assuming it.
-    func restart(completion: @escaping () -> Void) {
-        start(completion: completion)
-    }
-
-    func stop() {
-        stop(completion: nil)
-    }
-
-    /// Stops the engine and, when given a completion, calls it on the main
-    /// thread once the input device is actually released.
-    ///
-    /// The completion exists for one caller: the processed microphone starts
-    /// voice processing on the same physical input this meter holds, so the
-    /// device has to be released before voice processing claims it. The engine
-    /// is serialized on `lifecycleQueue`, which makes `stop()` a request rather
-    /// than a guarantee, so a caller that needs the device free waits for this
-    /// completion rather than assuming it.
-    func stop(completion: (() -> Void)?) {
-        // Invalidate before dispatching so a start already queued behind this
-        // cannot bring the engine back up after the caller asked for silence.
-        restartsArmed = false
-        invalidateSession()
-        cancelScheduledRestart()
-        lifecycleQueue.async { [self] in
-            teardownResources()
-            guard let completion else {
+            guard holdGeneration.isCurrent(holdToken) else {
+                // The meter being replaced keeps running, as any meter does
+                // while the window holds.
+                interrupt(deviceID: deviceID, transport: "-", session: session, holdToken: holdToken)
                 return
             }
-            DispatchQueue.main.async(execute: completion)
-        }
-    }
-
-    /// Stops capturing now and lets go of the engine shortly after.
-    ///
-    /// The Bluetooth pause calls this every time the panels close. Stopping
-    /// the engine ends the IO — the in-use light goes out — but a stopped
-    /// engine still holds its claim on the input device, and with a Bluetooth
-    /// headset that claim alone keeps the link in call mode with playback
-    /// degraded. Measured directly: stop(), reset(), and
-    /// deallocateRenderResources() all leave that pin in place, and only
-    /// releasing the engine object frees it. The release is deferred rather
-    /// than immediate because deallocating an AVAudioEngine in the middle of
-    /// a device-change storm is what crashed a pre-publication build —
-    /// AVFAudio's own IO unit property listener races the dealloc — and a
-    /// transport-change suspend runs milliseconds after a device arrived. The
-    /// configuration observer comes off too; a device change while suspended
-    /// must not schedule a restart the policy never asked for. `stop()`
-    /// remains the immediate-teardown path for shutdown and for handing the
-    /// input to the processed microphone.
-    func suspend() {
-        restartsArmed = false
-        invalidateSession()
-        cancelScheduledRestart()
-        lifecycleQueue.async { [self] in
-            if let configurationObserver {
-                NotificationCenter.default.removeObserver(configurationObserver)
-                self.configurationObserver = nil
-            }
-            quiesceEngine()
-            scheduleEngineRelease()
-        }
-    }
-
-    /// Runs only on `lifecycleQueue`. See `suspend()` for why the release
-    /// exists and why it waits. A start that lands meanwhile cancels it and
-    /// reuses the engine.
-    private func scheduleEngineRelease() {
-        pendingEngineRelease?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self else {
+            guard
+                stopResources(holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
+            else {
+                // What the previous meter still holds stays until the next
+                // start or stop after the window.
+                post(.interrupted(deviceID), session: session)
                 return
             }
-            pendingEngineRelease = nil
-            engine = nil
+            open(deviceID: deviceID, session: session, holdToken: holdToken)
         }
-        pendingEngineRelease = workItem
-        lifecycleQueue.asyncAfter(deadline: .now() + 2.5, execute: workItem)
     }
 
-    private func startEngine(session: UUID) {
-        pendingEngineRelease?.cancel()
-        pendingEngineRelease = nil
-        // Reuse the engine instead of building one per start. Releasing an
-        // AVAudioEngine races AVFAudio's own IO unit property listener: an
-        // arriving device fires that listener on the AVAudioIOUnit queue while
-        // the last reference goes away here, and the block then messages freed
-        // memory. Observed on hardware as a crash the first time AirPods
-        // became the default input, with this queue inside
-        // -[AVAudioEngine dealloc] and the listener block on the other side of
-        // the race. A restart is exactly when the listener is busiest, so the
-        // restart path keeps the object and redoes only the tap.
-        let engine = self.engine ?? AVAudioEngine()
-        // Retain it before reading inputNode. That read is what instantiates
-        // the IO unit and registers the listener, and an early return below
-        // would otherwise drop the only reference to a brand-new engine
-        // immediately after it.
-        self.engine = engine
-        // The call that can spin. It runs on the lifecycle queue, so a
-        // microphone that never answers costs this queue and nothing else.
-        let inputNode = engine.inputNode
-        // The hardware format, not outputFormat(forBus:). They agree only while
-        // the input device runs at the engine's rate. An AirPods microphone
-        // runs at 24 kHz while outputFormat keeps reporting 48 kHz, and a tap
-        // installed at the wrong rate starts without ever delivering a frame —
-        // the meter sits at `--` with nothing to report. Reading the input side
-        // gives the rate the device is actually running at.
-        let format = inputNode.inputFormat(forBus: 0)
-
-        guard isCurrentSession(session) else {
-            return
-        }
-
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            report(localized("The selected microphone did not provide an audio format."), session: session)
-            return
-        }
-
-        // Passing the hardware format explicitly. nil resolves to the node's
-        // outputFormat, which is the rate that does not match a 24 kHz
-        // microphone, and the engine then refuses to start at all
-        // (kAudioUnitErr_FormatNotSupported). A format that disagrees with the
-        // hardware is also what -installTapOnBus: raises on, and an
-        // Objective-C exception cannot be caught from Swift, so this has to be
-        // the rate the device is really running at.
-        // Even freshly read, the format can be stale by the time AVFAudio
-        // validates it inside installTap: a device change in flight moves the
-        // hardware rate between the read and the install, and the resulting
-        // Objective-C exception cannot be caught from Swift — it killed
-        // builds 42 and 45 during fast microphone switching. The shim turns
-        // it into a value, and the scheduled restart tries again once the
-        // change has settled.
-        let installException = ALBCatchObjCException {
-            inputNode.installTap(
-                onBus: 0,
-                bufferSize: AVAudioFrameCount(
-                    min(max(format.sampleRate * 0.1, 1_024), 8_192)
-                ),
-                format: format
-            ) { [weak self] buffer, _ in
-                guard let levels = Self.levels(from: buffer) else {
-                    return
+    /// Stops and destroys the IOProc and calls `completion` on the main
+    /// thread with what became of the stop.
+    ///
+    /// The session is invalidated before dispatching, so a start already
+    /// queued behind this cannot bring the meter back up. Like a start, the
+    /// stop takes the quiet window's generation now and compares it
+    /// immediately before each HAL call it makes: a window that armed in
+    /// between leaves what the meter still holds as it is, with its levels no
+    /// longer reported, and `.stopInterrupted` tells the owner to stop it
+    /// again after the window.
+    func stop(holdToken issuedToken: UInt64? = nil, completion: ((StopOutcome) -> Void)? = nil) {
+        let session = replaceSession()
+        let holdToken = issuedToken ?? holdGeneration.current
+        lifecycleQueue.async { [self] in
+            let outcome: StopOutcome
+            if !isCurrentSession(session) {
+                // The newer start or stop releases what the meter holds when
+                // its turn comes.
+                outcome = .superseded
+            } else {
+                switch stopResources(holdToken: holdToken) {
+                case .released:
+                    outcome = .stopped
+                case .interrupted:
+                    post(.stopInterrupted, session: session)
+                    outcome = .interrupted
                 }
+            }
+            if let completion {
                 DispatchQueue.main.async {
-                    guard self?.isCurrentSession(session) == true else {
-                        return
-                    }
-                    self?.onLevel?(levels.rms, levels.peak)
+                    completion(outcome)
                 }
             }
         }
-        if let installException {
-            report(
-                localized(
-                    "Could not start microphone level monitoring: %@",
-                    installException.reason ?? installException.name.rawValue
-                ),
-                session: session
-            )
-            scheduleShimRetry(session: session)
-            return
-        }
+    }
 
-        // start can raise the same way installTap can — AVFAudio's graph
-        // configuration checks the rate again and raises rather than returns
-        // when it moved — so the shim covers it too. A Swift error thrown by
-        // start comes out through startError instead.
-        var startError: Error?
-        let startException = ALBCatchObjCException {
-            do {
-                engine.prepare()
-                try engine.start()
-            } catch {
-                startError = error
+    /// coreaudiod restarted. The IOProc and its listeners went with the old
+    /// server, and their IDs may name something else now, so they are dropped
+    /// on the lifecycle queue without a HAL call: no stop, destroy or listener
+    /// removal. The session ends here, so a start or stop already queued
+    /// reports nothing. The owner starts the meter again after the window.
+    func forgetAfterServiceRestart() {
+        invalidateSession()
+        lifecycleQueue.async { [self] in
+            guard let held = resources else {
+                return
+            }
+            resources = nil
+            held.capture.close()
+            HALLifecycleLog.record(
+                .microphoneIOProc,
+                .forget,
+                id: held.deviceID,
+                transport: held.transport,
+                generation: holdGeneration.current
+            )
+        }
+    }
+
+    /// The label of the meter's stop in Quit's `LifecycleStopGroup`.
+    static let quitStopLabel = "microphone"
+
+    /// Main thread, Quit only. Ends the session and closes the current
+    /// capture's gate, so its IOProc passes nothing on while the process
+    /// exits. Both happen under one lock: a start on the lifecycle queue
+    /// either set its capture before this reads it, and that capture is
+    /// closed, or sets it afterwards and fails its next session check, so it
+    /// never reaches `AudioDeviceStart`. Quit's stop releases what it built.
+    func closeLevelGateAtQuit() {
+        sessionLock.lock()
+        sessionID = UUID()
+        let capture = liveCapture
+        sessionLock.unlock()
+        capture?.close()
+    }
+
+    /// Quit only. Stops and destroys the IOProc on the lifecycle queue,
+    /// whatever the quiet window, and counts it in `stops`, reporting
+    /// progress before each HAL call. Nothing is delivered to the main
+    /// thread, which is waiting.
+    func stopAtQuit(in stops: LifecycleStopGroup) {
+        invalidateSession()
+        stops.run(label: Self.quitStopLabel, on: lifecycleQueue) { [self] progress in
+            stopResources(holdToken: nil, reason: HALLifecycleLog.quitReason, progress: progress)
+        }
+    }
+
+    /// Runs only on `lifecycleQueue`.
+    private func open(deviceID: AudioDeviceID, session: UUID, holdToken: UInt64) {
+        // Read the exact device again, uncached, immediately before opening
+        // it. The poll that chose it may be a quarter of a second old, and an
+        // aggregate's active sub-devices can change while its ID stays.
+        let info = halCalls.transportInfo(for: deviceID)
+        let transport = AudioDeviceTransportInfo.logDescription(info)
+        let firstNote: InputOpenNote
+        switch InputOpenPolicy.decide(deviceID: deviceID, info: info) {
+        case .refuse(let refusal):
+            HALLifecycleLog.record(
+                .microphoneIOProc,
+                .refuse,
+                id: deviceID,
+                transport: transport,
+                generation: holdToken
+            )
+            post(.refused(deviceID, refusal), session: session)
+            return
+        case .open(let note):
+            firstNote = note
+            if note.shouldBeLogged {
+                HALLifecycleLog.record(
+                    .microphoneIOProc,
+                    .openUnverified,
+                    id: deviceID,
+                    transport: transport,
+                    generation: holdToken
+                )
             }
         }
-        if let startException {
-            inputNode.removeTap(onBus: 0)
-            report(
-                localized(
-                    "Could not start microphone level monitoring: %@",
-                    startException.reason ?? startException.name.rawValue
-                ),
-                session: session
-            )
-            scheduleShimRetry(session: session)
-            return
-        }
-        if let startError {
-            inputNode.removeTap(onBus: 0)
-            report(
-                localized("Could not start microphone level monitoring: %@", startError.localizedDescription),
-                session: session
-            )
+
+        guard let format = halCalls.inputStreamFormat(for: deviceID) else {
+            post(.failed(deviceID, .unsupportedFormat), session: session)
             return
         }
         guard isCurrentSession(session) else {
-            // A stop landed while the engine was starting. Undo it here
-            // rather than leave a running engine nothing will stop.
-            inputNode.removeTap(onBus: 0)
-            engine.stop()
             return
         }
-        DispatchQueue.main.async { [weak self] in
-            self?.shimRetryCount = 0
-        }
-        observeConfigurationChanges(of: engine)
-    }
-
-    /// Runs only on `lifecycleQueue`.
-    ///
-    /// Registered once per engine. The engine outlives a restart, so re-adding
-    /// this on every start would stack observers on one object.
-    private func observeConfigurationChanges(of engine: AVAudioEngine) {
-        guard configurationObserver == nil else {
+        guard holdGeneration.isCurrent(holdToken) else {
+            interrupt(deviceID: deviceID, transport: transport, session: session, holdToken: holdToken)
             return
         }
-        configurationObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
-            queue: .main
-        ) { [weak self] _ in
-            self?.scheduleRestart()
-        }
-    }
 
-    /// Runs only on `lifecycleQueue`.
-    ///
-    /// Stops the engine and drops its tap while keeping the object, so a
-    /// restart never has to deallocate one. `teardownResources()` remains the
-    /// path that actually lets the input device go, for the caller that needs
-    /// it free.
-    private func quiesceEngine() {
-        guard let engine else {
+        let capture = CaptureContext(
+            session: session,
+            deviceID: deviceID,
+            sampleFormat: format.sampleFormat,
+            windowSampleCount: AudioBufferLevels.windowSampleCount(
+                sampleRate: format.sampleRate,
+                channelCount: format.channelCount
+            ),
+            owner: self
+        )
+        HALLifecycleLog.begin(
+            .microphoneIOProc,
+            .create,
+            id: deviceID,
+            transport: transport,
+            generation: holdToken
+        )
+        let (createStatus, newIOProcID) = halCalls.createIOProc(
+            deviceID: deviceID,
+            queue: processingQueue
+        ) { [capture] _, inputData, _, _, _ in
+            capture.consume(inputData)
+        }
+        HALLifecycleLog.record(
+            .microphoneIOProc,
+            .create,
+            id: deviceID,
+            transport: transport,
+            status: createStatus,
+            generation: holdToken
+        )
+        guard createStatus == noErr, let newIOProcID else {
+            capture.close()
+            post(
+                .failed(
+                    deviceID,
+                    .operationFailed(
+                        localized("Creating the microphone IOProc"),
+                        createStatus == noErr ? kAudioHardwareUnspecifiedError : createStatus
+                    )
+                ),
+                session: session
+            )
             return
         }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-    }
+        resources = Resources(
+            deviceID: deviceID,
+            transport: transport,
+            capture: capture,
+            ioProcID: newIOProcID
+        )
+        sessionLock.lock()
+        liveCapture = capture
+        sessionLock.unlock()
+        addListeners(
+            for: capture,
+            properties: Self.invalidatingProperties
+                + (AggregateMembershipPolicy.watchesSubDeviceLists(info) ? SubDeviceListProperty.addresses : []),
+            transport: transport,
+            holdToken: holdToken
+        )
 
-    /// Runs only on `lifecycleQueue`.
-    private func teardownResources() {
-        pendingEngineRelease?.cancel()
-        pendingEngineRelease = nil
-        if let configurationObserver {
-            NotificationCenter.default.removeObserver(configurationObserver)
-            self.configurationObserver = nil
-        }
-        guard let engine else {
+        guard isCurrentSession(session) else {
+            // The newer start or stop is queued behind this one and releases
+            // it, after its own generation check.
             return
         }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        self.engine = nil
-    }
 
-    private func report(_ message: String, session: UUID) {
-        DispatchQueue.main.async { [weak self] in
-            guard self?.isCurrentSession(session) == true else {
+        // Read the device again now that its listeners are in place. A
+        // sub-device change made before this read is in it, and one made after
+        // it reaches a listener, so nothing starts on the first read alone.
+        let startInfo = halCalls.transportInfo(for: deviceID)
+        let startTransport = AudioDeviceTransportInfo.logDescription(startInfo)
+        resources?.transport = startTransport
+        switch InputOpenSequence.afterListeners(
+            deviceID: deviceID,
+            secondInfo: startInfo,
+            generationCurrent: holdGeneration.isCurrent(holdToken)
+        ) {
+        case let .interrupt(refusal):
+            if refusal != nil {
+                HALLifecycleLog.record(
+                    .microphoneIOProc,
+                    .refuse,
+                    id: deviceID,
+                    transport: startTransport,
+                    generation: holdToken
+                )
+            }
+            // Created, not started. The owner's next start or stop, after the
+            // window, releases it.
+            interrupt(deviceID: deviceID, transport: startTransport, session: session, holdToken: holdToken)
+            return
+        case let .refuseAndRelease(refusal):
+            HALLifecycleLog.record(
+                .microphoneIOProc,
+                .refuse,
+                id: deviceID,
+                transport: startTransport,
+                generation: holdToken
+            )
+            // Created, never started: released here, as a failed start is.
+            guard
+                stopResources(holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
+            else {
+                post(.interrupted(deviceID), session: session)
                 return
             }
-            self?.onError?(message)
-        }
-    }
-
-    private func cancelScheduledRestart() {
-        if Thread.isMainThread {
-            scheduledRestart?.cancel()
-            scheduledRestart = nil
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.scheduledRestart?.cancel()
-                self?.scheduledRestart = nil
+            post(.refused(deviceID, refusal), session: session)
+            return
+        case let .start(note):
+            if note.shouldBeLogged, note != firstNote {
+                HALLifecycleLog.record(
+                    .microphoneIOProc,
+                    .openUnverified,
+                    id: deviceID,
+                    transport: startTransport,
+                    generation: holdToken
+                )
             }
         }
+        if InputOpenSequence.addsSubDeviceListenersAfterSecondRead(first: info, second: startInfo) {
+            addListeners(
+                for: capture,
+                properties: SubDeviceListProperty.addresses,
+                transport: startTransport,
+                holdToken: holdToken
+            )
+        }
+
+        resources?.ioProc = .startUnconfirmed
+        HALLifecycleLog.begin(
+            .microphoneIOProc,
+            .start,
+            id: deviceID,
+            transport: startTransport,
+            generation: holdToken
+        )
+        let startStatus = halCalls.start(deviceID: deviceID, ioProcID: newIOProcID)
+        HALLifecycleLog.record(
+            .microphoneIOProc,
+            .start,
+            id: deviceID,
+            transport: startTransport,
+            status: startStatus,
+            generation: holdToken
+        )
+        guard startStatus == noErr else {
+            guard
+                stopResources(holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
+            else {
+                // The start waited long enough for a window to arm. What it
+                // created and has not released yet is released after the
+                // window, not inside it.
+                post(.interrupted(deviceID), session: session)
+                return
+            }
+            post(
+                .failed(
+                    deviceID,
+                    .operationFailed(localized("Starting microphone level monitoring"), startStatus)
+                ),
+                session: session
+            )
+            return
+        }
+        resources?.ioProc = .started
+
+        guard isCurrentSession(session) else {
+            // A stop or another start landed while this one was starting. It
+            // is queued behind this one and stops what started here, after
+            // its own generation check.
+            return
+        }
+        post(.started(deviceID), session: session)
     }
 
-    /// Retries a start whose AVFAudio call raised, once the device change
-    /// that made it raise has settled. Gated on the session still being
-    /// current — a newer start supersedes the failed one and must not be
-    /// torn down by its predecessor's retry — and on the retry budget.
-    private func scheduleShimRetry(session: UUID) {
+    /// Runs only on `lifecycleQueue`. Adds one listener block for
+    /// `properties` to what the current resources already listen to.
+    ///
+    /// A listener that cannot be added is logged and skipped rather than
+    /// failing the start: the poll still notices a default-input change, and
+    /// the level math reads each buffer's own byte size.
+    private func addListeners(
+        for capture: CaptureContext,
+        properties: [AudioObjectPropertyAddress],
+        transport: String,
+        holdToken: UInt64
+    ) {
+        let deviceID = capture.deviceID
+        let session = capture.session
+        let listener: AudioObjectPropertyListenerBlock = resources?.listenerBlock ?? { [weak self, capture] count, addresses in
+            // Only closes the gate, tells the owner on the main thread, and
+            // for an aggregate's active sub-devices asks the lifecycle queue
+            // to read the device again. A change of its full composition only
+            // invalidates. Never a HAL call.
+            let activeSubDevicesChanged = SubDeviceListProperty.isActiveAmong(count, addresses)
+            if capture.close() {
+                self?.post(.invalidated(deviceID), session: session)
+            }
+            if activeSubDevicesChanged {
+                self?.recheckAggregateMembership(of: capture)
+            }
+        }
+
+        var listened = resources?.listenedProperties ?? []
+        for property in properties {
+            let status = halCalls.addPropertyListener(
+                deviceID: deviceID,
+                address: property,
+                queue: listenerQueue,
+                block: listener
+            )
+            if status == noErr {
+                listened.append(property)
+            } else {
+                HALLifecycleLog.record(
+                    .microphoneListener,
+                    .create,
+                    id: deviceID,
+                    transport: transport,
+                    status: status,
+                    generation: holdToken
+                )
+            }
+        }
+        resources?.listenerBlock = listener
+        resources?.listenedProperties = listened
+    }
+
+    /// Runs only on `lifecycleQueue`. Releases everything the current
+    /// resources hold, one HAL call at a time, in `LifecycleTeardown`'s order:
+    /// the listeners, the stop, then the IOProc. After a start that did not
+    /// return `noErr`, whether the device reports the IO running is read
+    /// first, and running IO is stopped before its IOProc is destroyed.
+    ///
+    /// `holdToken` is the quiet window's generation the release was issued
+    /// in, compared immediately before the listener removal and before each
+    /// lifecycle call. At a mismatch the release ends there, logs the call it
+    /// held back as `interruption`, and keeps what remains, recorded as far as
+    /// it got, for the next start or stop after the window. A device that
+    /// already vanished answers with a bad device or bad object status, which
+    /// is logged and otherwise tolerated.
+    ///
+    /// - Parameters:
+    ///   - holdToken: nil for a release the quiet window does not hold.
+    ///   - interruption: `interrupt-stop` for a stop, `interrupt` for the
+    ///     release a start makes of what it replaces or created.
+    ///   - reason: Set when the release is exempt from the quiet window, for
+    ///     the log.
+    ///   - progress: At Quit, told the phase immediately before each HAL call.
+    @discardableResult
+    private func stopResources(
+        holdToken: UInt64?,
+        loggingAnInterruptionAs interruption: HALLifecycleLog.Operation = .interruptStop,
+        reason: String? = nil,
+        progress: LifecycleStopGroup.Progress? = nil
+    ) -> Release {
+        guard var current = resources else {
+            return .released
+        }
+        current.capture.close()
+
+        if let listenerBlock = current.listenerBlock {
+            guard holdGeneration.allows(holdToken) else {
+                return interruptRelease(of: current, as: interruption, holdToken: holdToken)
+            }
+            progress?.report(.removeListeners)
+            for property in current.listenedProperties {
+                halCalls.removePropertyListener(
+                    deviceID: current.deviceID,
+                    address: property,
+                    queue: listenerQueue,
+                    block: listenerBlock
+                )
+            }
+            current.listenerBlock = nil
+            current.listenedProperties = []
+            resources = current
+        }
+
+        var teardown = LifecycleTeardown(ioProc: current.ioProc)
+        while let step = teardown.nextStep {
+            guard !step.isLifecycleCall || holdGeneration.allows(holdToken) else {
+                return interruptRelease(of: current, as: interruption, holdToken: holdToken)
+            }
+            progress?.report(LifecycleStopGroup.Phase(step))
+            switch step {
+            case .readIsRunning:
+                let (status, value) = halCalls.isRunning(current.deviceID)
+                teardown.noteIsRunning(status == noErr && value != 0)
+            case .stop:
+                let stopReason = teardown.stopFollowsUnconfirmedStart
+                    ? reason ?? HALLifecycleLog.unconfirmedStartReason
+                    : reason
+                HALLifecycleLog.begin(
+                    .microphoneIOProc,
+                    .stop,
+                    id: current.deviceID,
+                    transport: current.transport,
+                    generation: holdToken,
+                    reason: stopReason
+                )
+                let stopStatus = halCalls.stop(deviceID: current.deviceID, ioProcID: current.ioProcID)
+                HALLifecycleLog.record(
+                    .microphoneIOProc,
+                    .stop,
+                    id: current.deviceID,
+                    transport: current.transport,
+                    status: stopStatus,
+                    generation: holdToken,
+                    reason: stopReason
+                )
+                teardown.complete(.stop)
+            case .destroyIOProc:
+                HALLifecycleLog.begin(
+                    .microphoneIOProc,
+                    .destroy,
+                    id: current.deviceID,
+                    transport: current.transport,
+                    generation: holdToken,
+                    reason: reason
+                )
+                let destroyStatus = halCalls.destroyIOProc(
+                    deviceID: current.deviceID,
+                    ioProcID: current.ioProcID
+                )
+                HALLifecycleLog.record(
+                    .microphoneIOProc,
+                    .destroy,
+                    id: current.deviceID,
+                    transport: current.transport,
+                    status: destroyStatus,
+                    generation: holdToken,
+                    reason: reason
+                )
+                teardown.complete(.destroyIOProc)
+            case .destroyAggregate, .destroyProcessTap:
+                // The meter holds neither.
+                teardown.complete(step)
+            }
+            current.ioProc = teardown.ioProc
+            resources = current
+        }
+        resources = nil
+        return .released
+    }
+
+    /// Runs only on `lifecycleQueue`.
+    private func interruptRelease(
+        of held: Resources,
+        as operation: HALLifecycleLog.Operation,
+        holdToken: UInt64?
+    ) -> Release {
+        HALLifecycleLog.record(
+            .microphoneIOProc,
+            operation,
+            id: held.deviceID,
+            transport: held.transport,
+            generation: holdToken
+        )
+        return .interrupted
+    }
+
+    /// Listener queue. Has the lifecycle queue read the aggregate the IOProc
+    /// runs on again, uncached, after its active sub-devices changed.
+    ///
+    /// A last resort, and a lifecycle step the quiet window does not hold:
+    /// the meter never opens an aggregate that names a Bluetooth member, so
+    /// this is reached only when the composition is edited while it is open.
+    /// If a Bluetooth device is now active in the aggregate, the IOProc is
+    /// stopped and destroyed at once, because a stop of the app's own IO is
+    /// safer than letting it carry the headset's microphone through the
+    /// headset's configuration change. Nothing is started here; the owner
+    /// already has the invalidation and decides after the window. The stop is
+    /// not exempt from the hardware gate's judgement of stops against the
+    /// Bluetooth configuration-change requests.
+    private func recheckAggregateMembership(of capture: CaptureContext) {
+        lifecycleQueue.async { [self] in
+            guard let current = resources, current.capture === capture else {
+                // Already released, or replaced by a newer start.
+                return
+            }
+            let info = halCalls.transportInfo(for: current.deviceID)
+            guard AggregateMembershipPolicy.afterActiveSubDevicesChanged(info) == .stopNow else {
+                return
+            }
+            HALLifecycleLog.record(
+                .microphoneIOProc,
+                .refuse,
+                id: current.deviceID,
+                transport: AudioDeviceTransportInfo.logDescription(info),
+                generation: nil,
+                reason: SubDeviceListProperty.bluetoothJoinedReason
+            )
+            stopResources(holdToken: nil, reason: SubDeviceListProperty.bluetoothJoinedReason)
+        }
+    }
+
+    /// Runs only on `lifecycleQueue`.
+    private func interrupt(
+        deviceID: AudioDeviceID,
+        transport: String,
+        session: UUID,
+        holdToken: UInt64
+    ) {
+        HALLifecycleLog.record(
+            .microphoneIOProc,
+            .interrupt,
+            id: deviceID,
+            transport: transport,
+            generation: holdToken
+        )
+        post(.interrupted(deviceID), session: session)
+    }
+
+    private func post(_ event: Event, session: UUID) {
         DispatchQueue.main.async { [weak self] in
             guard let self, isCurrentSession(session) else {
                 return
             }
-            guard shimRetryCount < 8 else {
-                return
-            }
-            shimRetryCount += 1
-            scheduleRestart()
+            onEvent?(event)
         }
     }
 
-    private func scheduleRestart() {
-        guard restartsArmed, scheduledRestart == nil else {
-            return
+    fileprivate func deliverLevel(rmsDecibels: Float, peakDecibels: Float, session: UUID) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, isCurrentSession(session) else {
+                return
+            }
+            onLevel?(rmsDecibels, peakDecibels)
         }
-
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.scheduledRestart = nil
-            self?.start()
-        }
-        scheduledRestart = workItem
-        // Long enough for the input rebinding behind a configuration change to
-        // settle. A restart that lands while AVFAudio is still inside
-        // IOBindingChanged touches a node whose format is in the middle of
-        // moving. Measured on hardware, 0.3 s is not clear of that window and
-        // 0.75 s is.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: workItem)
     }
 
     private func replaceSession() -> UUID {
+        let newSessionID = UUID()
         sessionLock.lock()
-        defer { sessionLock.unlock() }
-        sessionID = UUID()
-        return sessionID
+        sessionID = newSessionID
+        sessionLock.unlock()
+        return newSessionID
     }
 
     private func invalidateSession() {
-        sessionLock.lock()
-        sessionID = UUID()
-        sessionLock.unlock()
+        _ = replaceSession()
     }
 
-    private func isCurrentSession(_ session: UUID) -> Bool {
+    private func isCurrentSession(_ candidate: UUID) -> Bool {
         sessionLock.lock()
         defer { sessionLock.unlock() }
-        return sessionID == session
+        return sessionID == candidate
+    }
+}
+
+/// The sub-device lists of an aggregate device, which the microphone meter
+/// and the processed microphone's capture watch on an aggregate they have
+/// open: the active sub-devices, whose change is read again at once, and the
+/// full composition, whose change only invalidates.
+enum SubDeviceListProperty {
+    static let active = AudioObjectPropertyAddress(
+        mSelector: kAudioAggregateDevicePropertyActiveSubDeviceList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    static let full = AudioObjectPropertyAddress(
+        mSelector: kAudioAggregateDevicePropertyFullSubDeviceList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    static let addresses = [active, full]
+
+    /// The `reason` on the log lines of an IOProc stopped at once because a
+    /// Bluetooth device became active in its aggregate.
+    static let bluetoothJoinedReason = "bluetooth-sub-device"
+
+    /// Whether a property listener was called for the active sub-device list.
+    static func isActiveAmong(
+        _ count: UInt32,
+        _ addresses: UnsafePointer<AudioObjectPropertyAddress>
+    ) -> Bool {
+        UnsafeBufferPointer(start: addresses, count: Int(count)).contains {
+            $0.mSelector == kAudioAggregateDevicePropertyActiveSubDeviceList
+        }
+    }
+}
+
+/// One session's capture state, shared by the IOProc block, the listeners and
+/// the lifecycle queue.
+///
+/// The IOProc block holds it strongly, and a block already queued on the
+/// processing queue can outlive `AudioDeviceDestroyIOProcID`; the closed gate
+/// is what keeps such a block from reporting anything.
+private final class CaptureContext {
+    let session: UUID
+    let deviceID: AudioDeviceID
+    private let sampleFormat: PCMSampleFormat
+    private let windowSampleCount: Int
+    private weak var owner: MicrophoneMeter?
+    private let gate = OSAllocatedUnfairLock(initialState: true)
+    /// Processing-queue confined.
+    private var accumulator = LevelAccumulator()
+
+    init(
+        session: UUID,
+        deviceID: AudioDeviceID,
+        sampleFormat: PCMSampleFormat,
+        windowSampleCount: Int,
+        owner: MicrophoneMeter
+    ) {
+        self.session = session
+        self.deviceID = deviceID
+        self.sampleFormat = sampleFormat
+        self.windowSampleCount = windowSampleCount
+        self.owner = owner
     }
 
-    private static func levels(from buffer: AVAudioPCMBuffer) -> (rms: Float, peak: Float)? {
+    /// Runs only on the processing queue.
+    func consume(_ inputData: UnsafePointer<AudioBufferList>) {
+        guard gate.withLock({ $0 }) else {
+            return
+        }
+        accumulator.add(inputData, format: sampleFormat)
         guard
-            let channelData = buffer.floatChannelData,
-            buffer.frameLength > 0,
-            buffer.format.channelCount > 0
+            accumulator.sampleCount >= windowSampleCount,
+            let levels = accumulator.take()
         else {
-            return nil
+            return
         }
-
-        let frameCount = Int(buffer.frameLength)
-        let channelCount = Int(buffer.format.channelCount)
-        var sumOfSquares: Float = 0
-        var peak: Float = 0
-
-        for channel in 0..<channelCount {
-            let samples = channelData[channel]
-            for frame in 0..<frameCount {
-                let amplitude = abs(samples[frame])
-                sumOfSquares += amplitude * amplitude
-                peak = max(peak, amplitude)
-            }
-        }
-
-        let sampleCount = Float(frameCount * channelCount)
-        let rms = sqrt(sumOfSquares / sampleCount)
-        return (
-            rms: MeterScale.decibels(amplitude: rms),
-            peak: MeterScale.decibels(amplitude: peak)
+        owner?.deliverLevel(
+            rmsDecibels: levels.rmsDecibels,
+            peakDecibels: levels.peakDecibels,
+            session: session
         )
+    }
+
+    /// Stops reporting. True when this call closed an open gate.
+    @discardableResult
+    func close() -> Bool {
+        gate.withLock { isOpen in
+            defer { isOpen = false }
+            return isOpen
+        }
     }
 }

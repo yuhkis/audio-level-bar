@@ -4,6 +4,7 @@ import AudioLevelBarCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var audioState: AudioState?
     private var statusBarController: StatusBarController?
+    private var quitCoordinator: QuitCoordinator?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -17,8 +18,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         audioState = state
         statusBarController = statusController
+        quitCoordinator = QuitCoordinator(
+            scheduler: MainRunLoopScheduler(),
+            requestQuit: { state.requestQuit() },
+            remainingDeferral: { state.remainingQuitDeferral() },
+            removeStatusItem: { statusController.stop() },
+            tearDown: { state.stop() },
+            letTerminationProceed: {
+                NSApplication.shared.reply(toApplicationShouldTerminate: true)
+            }
+        )
         state.start()
         statusController.showControlWindow()
+    }
+
+    /// Quit, from the menu item or an Apple event. While the quiet window
+    /// holds, the menu bar item goes at once and the teardown waits until
+    /// 3 s after the last change the window noted, at most
+    /// `QuitPlan.deferralMaximum` after the request; see `QuitCoordinator`.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let quitCoordinator else {
+            return .terminateNow
+        }
+        switch quitCoordinator.applicationShouldTerminate() {
+        case .now:
+            return .terminateNow
+        case .later:
+            return .terminateLater
+        }
     }
 
     func applicationShouldHandleReopen(
@@ -29,9 +56,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    /// Tears down only when Quit's own sequence has not already, as for a
+    /// termination that bypassed `applicationShouldTerminate(_:)`.
     func applicationWillTerminate(_ notification: Notification) {
-        statusBarController?.stop()
-        audioState?.stop()
+        guard let quitCoordinator else {
+            statusBarController?.stop()
+            audioState?.stop()
+            return
+        }
+        quitCoordinator.applicationWillTerminate()
     }
 
     private func migrateStatusItemPositionIfNeeded() {

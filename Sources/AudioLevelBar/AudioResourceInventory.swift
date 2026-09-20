@@ -23,6 +23,10 @@ enum AudioResourceInventory {
         let name: String
         let ownership: AudioResourceOwnership
         let isRunningSomewhere: Bool
+        /// The UIDs of the process taps the aggregate lists
+        /// (`kAudioAggregateDevicePropertyTapList`), or nil when they could
+        /// not be read.
+        let tapUIDs: [String]?
     }
 
     struct ProcessTap {
@@ -126,10 +130,21 @@ enum AudioResourceInventory {
         }
     }
 
-    static func aggregateDevices() -> [AggregateDevice] {
-        allObjectIDs(selector: kAudioHardwarePropertyDevices).compactMap { deviceID in
-            guard transportType(of: deviceID) == kAudioDeviceTransportTypeAggregate else {
+    /// Every aggregate device, or nil when the device list, or the transport
+    /// of any listed device, could not be read. An aggregate device whose
+    /// transport read failed would otherwise go missing from the list, and
+    /// the tap reclaim would take its taps for leftovers.
+    static func aggregateDevices() -> [AggregateDevice]? {
+        guard let deviceIDs = allObjectIDs(selector: kAudioHardwarePropertyDevices) else {
+            return nil
+        }
+        var aggregates: [AggregateDevice] = []
+        for deviceID in deviceIDs {
+            guard let transport = transportType(of: deviceID) else {
                 return nil
+            }
+            guard transport == kAudioDeviceTransportTypeAggregate else {
+                continue
             }
             let uid = stringProperty(
                 deviceID,
@@ -139,22 +154,54 @@ enum AudioResourceInventory {
                 deviceID,
                 selector: kAudioObjectPropertyName
             ) ?? "(name could not be read)"
-            return AggregateDevice(
-                objectID: deviceID,
-                uid: uid,
-                name: name,
-                ownership: AudioResourceClassifier.ownership(
-                    ofAggregateUID: uid,
-                    in: namespace
-                ),
-                isRunningSomewhere: isRunningSomewhere(deviceID)
+            aggregates.append(
+                AggregateDevice(
+                    objectID: deviceID,
+                    uid: uid,
+                    name: name,
+                    ownership: AudioResourceClassifier.ownership(
+                        ofAggregateUID: uid,
+                        in: namespace
+                    ),
+                    isRunningSomewhere: isRunningSomewhere(deviceID),
+                    tapUIDs: tapUIDs(of: deviceID)
+                )
             )
         }
+        return aggregates
+    }
+
+    /// The UIDs in an aggregate device's tap list, or nil when the list could
+    /// not be read or holds something other than a UID.
+    private static func tapUIDs(of deviceID: AudioObjectID) -> [String]? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioAggregateDevicePropertyTapList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: Unmanaged<CFArray>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFArray>?>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
+        guard status == noErr else {
+            return nil
+        }
+        guard let value else {
+            return []
+        }
+        var uids: [String] = []
+        for element in value.takeRetainedValue() as NSArray {
+            guard let uid = element as? String else {
+                return nil
+            }
+            uids.append(uid)
+        }
+        return uids
     }
 
     @available(macOS 14.2, *)
     static func processTaps() -> [ProcessTap] {
-        allObjectIDs(selector: kAudioHardwarePropertyTapList).map { tapID in
+        // An unreadable tap list lists no candidates, which reclaims nothing.
+        (allObjectIDs(selector: kAudioHardwarePropertyTapList) ?? []).map { tapID in
             let uid = stringProperty(
                 tapID,
                 selector: kAudioTapPropertyUID
@@ -251,9 +298,11 @@ enum AudioResourceInventory {
         return pid
     }
 
+    /// The object IDs `selector` lists on the system object: empty for a list
+    /// read as empty, nil for one that could not be read.
     private static func allObjectIDs(
         selector: AudioObjectPropertySelector
-    ) -> [AudioObjectID] {
+    ) -> [AudioObjectID]? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -267,9 +316,11 @@ enum AudioResourceInventory {
                 0,
                 nil,
                 &size
-            ) == noErr,
-            size > 0
+            ) == noErr
         else {
+            return nil
+        }
+        guard size > 0 else {
             return []
         }
 
@@ -285,7 +336,7 @@ enum AudioResourceInventory {
                 &objectIDs
             ) == noErr
         else {
-            return []
+            return nil
         }
         return objectIDs
     }

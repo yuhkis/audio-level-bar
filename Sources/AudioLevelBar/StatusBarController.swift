@@ -341,16 +341,15 @@ final class StatusBarController: NSObject {
         }
 
         let microphoneText: String
-        let microphoneIsMetering = state.microphonePermission == .authorized
-            && !state.microphoneMonitoringPaused
+        let microphoneIsMetering = state.microphoneLevelIsLive
         if microphoneIsMetering {
             microphoneText = microphoneDecibels > MeterScale.displayFloorDecibels
                 ? String(format: "%.0f", microphoneDecibels)
                 : "−∞"
         } else {
-            // Denied, or deliberately paused on a Bluetooth input. Either way
-            // nothing is being measured, which is not the same as measuring
-            // silence.
+            // Denied, a Bluetooth input the app does not open, or a start not
+            // yet running. Either way nothing is being measured, which is not
+            // the same as measuring silence.
             microphoneText = "--"
         }
 
@@ -447,7 +446,7 @@ final class StatusBarController: NSObject {
         let accessibilityValue: String
         if state.microphonePermission == .authorized, !microphoneIsMetering {
             accessibilityValue = localized(
-                "%1$@, microphone monitoring paused%2$@%3$@",
+                "%1$@, microphone level not measured%2$@%3$@",
                 outputAccessibilityText,
                 inputGainText,
                 inputMuteText

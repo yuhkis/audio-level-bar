@@ -21,6 +21,8 @@ let package = Package(
                 .swiftLanguageMode(.v5)
             ]
         ),
+        // Catches the Objective-C exceptions AVFAudio raises when a device
+        // changes under the processed microphone's engines.
         .target(
             name: "ObjCExceptionShim"
         ),
@@ -46,6 +48,15 @@ let package = Package(
         .testTarget(
             name: "AudioLevelBarCoreTests",
             dependencies: ["AudioLevelBarCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
+        ),
+        // The app target's HAL lifecycle wiring, through a fake
+        // HALLifecycleCalls. These tests never reach coreaudiod.
+        .testTarget(
+            name: "AudioLevelBarTests",
+            dependencies: ["AudioLevelBar", "AudioLevelBarCore", "ObjCExceptionShim"],
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]

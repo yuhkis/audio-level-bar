@@ -27,8 +27,9 @@ enum AudioDiagnostics {
 
     /// Destroys stranded process taps and reports what happened.
     ///
-    /// The app does this at every launch. This entry point exists so the sweep
-    /// can be run and checked on its own, without restarting the app.
+    /// The app does this after every launch, once the launch quiet window
+    /// admits starts. This entry point exists so the sweep can be run and
+    /// checked on its own, without restarting the app.
     static func runTapReclamation() {
         print("Audio Level Bar tap reclamation")
 
@@ -36,7 +37,12 @@ enum AudioDiagnostics {
             exit(halUnresponsiveExitCode)
         }
 
-        let outcome = OrphanedProcessTapReclaimer.reclaim()
+        let outcome = OrphanedProcessTapReclaimer.reclaim(
+            scope: .everyTapOfThisApp,
+            reason: "reclaim-command",
+            generation: nil,
+            halCalls: CoreAudioHALLifecycleCalls(audioSystem: CoreAudioSystem())
+        )
 
         switch outcome.skip {
         case .attributionUnavailable:
@@ -74,11 +80,35 @@ enum AudioDiagnostics {
         for uid in outcome.destroyedUIDs {
             print("  Destroyed: \(uid)")
         }
+        for uid in outcome.heldBackUIDs {
+            print("  Held back: \(uid)")
+        }
         for failure in outcome.failures {
             print("  Failed: \(failure.uid) (status \(failure.status))")
         }
+        if outcome.aggregatesUnread {
+            print(
+                """
+
+                Every candidate was held back: the device list, or the transport
+                  of a listed device, could not be read, so an aggregate device
+                  that lists one of these taps could not be ruled out.
+                """
+            )
+        } else if !outcome.heldBackUIDs.isEmpty {
+            print(
+                """
+
+                Held back taps are not destroyed while an aggregate device lists
+                  them, while an earlier published device still exists, or while
+                  an aggregate device of this app is running. Another app may
+                  still be recording through one of them.
+                """
+            )
+        }
         print(
             "\nDestroyed \(outcome.destroyedUIDs.count), "
+                + "held back \(outcome.heldBackUIDs.count), "
                 + "failed \(outcome.failures.count)"
         )
     }
@@ -140,7 +170,7 @@ enum AudioDiagnostics {
                 mute = "mute: \(muted ? "on" : "off") (read-only)"
             }
             print(
-                "\(marker) \(device.name) [\(device.uid)] — "
+                "\(marker) \(device.name) [\(device.uid)] id \(device.id) — "
                     + "\(channels) ch, \(volume), \(adjustability), \(mute)"
             )
         }
@@ -183,7 +213,10 @@ enum AudioDiagnostics {
     }
 
     private static func printAggregateDevices() {
-        let aggregates = AudioResourceInventory.aggregateDevices()
+        guard let aggregates = AudioResourceInventory.aggregateDevices() else {
+            print("\nAggregate devices: the device list, or a device's transport, could not be read")
+            return
+        }
         print("\nAggregate devices: \(aggregates.count)")
 
         if aggregates.isEmpty {
@@ -195,7 +228,7 @@ enum AudioDiagnostics {
             let inUse = aggregate.isRunningSomewhere ? ", in use" : ""
             print(
                 "  [\(label(for: aggregate.ownership))] \(aggregate.name) "
-                    + "[\(aggregate.uid)]\(inUse)"
+                    + "[\(aggregate.uid)] id \(aggregate.objectID)\(inUse)"
             )
         }
 
@@ -257,7 +290,7 @@ enum AudioDiagnostics {
                 }
                 .joined(separator: ", ")
             let restore = tap.restoresAcrossReboot ? ", restored after reboot" : ""
-            print("  [\(owner)] \(tap.name) [\(tap.uid)]\(restore)")
+            print("  [\(owner)] \(tap.name) [\(tap.uid)] id \(tap.objectID)\(restore)")
             let bundles = tap.attributionIsAuthoritative
                 ? (tap.bundleIDs.isEmpty
                     ? "(none listed)"
