@@ -30,6 +30,15 @@ import Foundation
 /// a stop, until the user retries or turns monitoring on, or the output
 /// device changes (`startOver()`).
 ///
+/// Sleep suspends all of it. From the system's will-sleep to its did-wake
+/// the Mac's dark wakes still run the owner's timers, while the output
+/// delivers nothing and the HAL reconfigures the built-in devices; counted,
+/// that silence rebuilt the meter every 12 s and gave up before the wake. So
+/// while asleep no silence is checked, an invalidation is neither counted
+/// nor spaced, and no rebuild is due. The wake starts the count over and
+/// owes one rebuild, due as soon as the quiet window the owner arms for it
+/// releases (`didWake()`).
+///
 /// Times are on the owner's lifecycle clock.
 public struct SystemOutputRecovery: Equatable {
     public static let staleDisplayAfter: TimeInterval = 2
@@ -59,6 +68,8 @@ public struct SystemOutputRecovery: Equatable {
     }
 
     private var phase: Phase = .idle
+    /// Between the system's will-sleep and its did-wake.
+    public private(set) var isAsleep = false
     /// Invalidations since the meter last ran `stableRunDuration` without
     /// one.
     public private(set) var consecutiveInvalidations = 0
@@ -114,6 +125,11 @@ public struct SystemOutputRecovery: Equatable {
     /// A listener reported the meter invalidated at `time`, or `check(at:)`
     /// returned `.rebuild`.
     public mutating func invalidated(at time: TimeInterval) {
+        guard !isAsleep else {
+            // Owed to the wake's rebuild: neither counted nor spaced.
+            phase = .idle
+            return
+        }
         if case let .running(since, _, _) = phase, time - since >= Self.stableRunDuration {
             consecutiveInvalidations = 0
         }
@@ -126,7 +142,28 @@ public struct SystemOutputRecovery: Equatable {
 
     /// Monitoring was turned off.
     public mutating func reset() {
+        let asleep = isAsleep
         self = SystemOutputRecovery()
+        isAsleep = asleep
+    }
+
+    /// The system is going to sleep. Levels are not watched, invalidations
+    /// are not counted, and no rebuild is due until `didWake()`.
+    public mutating func willSleep() {
+        isAsleep = true
+        phase = .idle
+    }
+
+    /// The system woke. Whatever the meter held may not have survived the
+    /// sleep, so the owner owes it one rebuild: the invalidations in a row
+    /// count from zero, rebuilds that gave up start over, and the rebuild is
+    /// due with no spacing. Levels are watched again once it reports it
+    /// started.
+    public mutating func didWake() {
+        isAsleep = false
+        phase = .idle
+        consecutiveInvalidations = 0
+        rebuildNotBefore = nil
     }
 
     /// The user retried or turned monitoring on, or the output device
@@ -143,7 +180,9 @@ public struct SystemOutputRecovery: Equatable {
     /// exhausted: a restart is neither a retry nor another output.
     public mutating func serviceRestarted() {
         let exhausted = rebuildsExhausted
+        let asleep = isAsleep
         self = SystemOutputRecovery()
+        isAsleep = asleep
         if exhausted {
             consecutiveInvalidations = Self.maximumConsecutiveInvalidations
         }
@@ -151,7 +190,7 @@ public struct SystemOutputRecovery: Equatable {
 
     /// Whether levels have stopped arriving by `time`.
     public mutating func check(at time: TimeInterval) -> Check {
-        guard case let .running(since, lastLevelAt, shownStale) = phase else {
+        guard !isAsleep, case let .running(since, lastLevelAt, shownStale) = phase else {
             return .none
         }
         let silence = time - lastLevelAt
@@ -166,9 +205,9 @@ public struct SystemOutputRecovery: Equatable {
     }
 
     /// Whether an owed rebuild may be issued at `time`: never while the
-    /// rebuilds are exhausted.
+    /// rebuilds are exhausted or the system is asleep.
     public func rebuildIsDue(at time: TimeInterval) -> Bool {
-        guard !rebuildsExhausted else {
+        guard !rebuildsExhausted, !isAsleep else {
             return false
         }
         guard let rebuildNotBefore else {

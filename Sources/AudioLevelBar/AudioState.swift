@@ -708,7 +708,14 @@ final class AudioState: ObservableObject {
                 }
             }
         }
-        // Log only: sleep and wake arm nothing and stop nothing here.
+        // Sleep and wake stop nothing. Sleep suspends the system playback
+        // meter's recovery; the wake owes it one rebuild after a window.
+        powerStateLog.onWillSleep = { [weak self] in
+            self?.systemWillSleep()
+        }
+        powerStateLog.onDidWake = { [weak self] in
+            self?.systemDidWake()
+        }
         powerStateLog.start()
     }
 
@@ -1958,6 +1965,32 @@ final class AudioState: ObservableObject {
             return
         }
         invalidateSystemOutputMeter(reason: "output-stale")
+        reconcileLifecycle()
+    }
+
+    /// Main thread, no HAL work. The system is going to sleep. Until it wakes,
+    /// the system playback meter's levels are not watched, its invalidations
+    /// are neither counted nor spaced, and no rebuild of it is issued: the
+    /// dark wakes of a sleeping Mac still run the poll, while the output
+    /// delivers nothing. Nothing is stopped and the window is not armed.
+    private func systemWillSleep() {
+        systemOutputRecovery.willSleep()
+    }
+
+    /// Main thread, no HAL work. The system woke. What the system playback
+    /// meter held may not have survived the sleep, and the HAL is
+    /// reconfiguring the built-in devices, so with monitoring on this arms
+    /// the window (`wake`) and owes the meter one rebuild, issued by the
+    /// release after it. Its rebuilds count from zero again, whether or not
+    /// they had given up.
+    private func systemDidWake() {
+        systemOutputRecovery.didWake()
+        guard !quitRequested, systemOutputMonitoringEnabled else {
+            return
+        }
+        noteLifecycleChange(reason: "wake")
+        _ = systemOutputIntent.handle(.invalidated(monitoringEnabled: true))
+        showSystemOutputRebuildOwed()
         reconcileLifecycle()
     }
 
@@ -3694,10 +3727,10 @@ final class AudioState: ObservableObject {
             showSystemOutputRebuildOwed()
             return
         }
-        guard
-            systemOutputIntent.handle(.rebuild(holding: lifecycleStartsHeld || systemOutputCallIsStalled)) == .start
-        else {
-            // Held back until the window ends.
+        // While the system sleeps, a rebuild waits for the one the wake owes.
+        let holding = lifecycleStartsHeld || systemOutputCallIsStalled || systemOutputRecovery.isAsleep
+        guard systemOutputIntent.handle(.rebuild(holding: holding)) == .start else {
+            // Held back until the window ends, or until the wake.
             levels.resetSystemOutput()
             publishIfChanged(\.systemOutputMonitoringState, .starting)
             return

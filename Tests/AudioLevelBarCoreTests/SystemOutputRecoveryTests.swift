@@ -265,4 +265,52 @@ final class SystemOutputRecoveryTests: XCTestCase {
 
         XCTAssertEqual(recovery, SystemOutputRecovery())
     }
+
+    func testSleepNeitherChecksSilenceNorCountsInvalidationsNorDueARebuild() {
+        var recovery = SystemOutputRecovery()
+        recovery.started(at: 0)
+        recovery.invalidated(at: 1)
+        XCTAssertEqual(recovery.consecutiveInvalidations, 1)
+
+        recovery.willSleep()
+        XCTAssertTrue(recovery.isAsleep)
+        XCTAssertFalse(recovery.isWatching)
+        XCTAssertFalse(recovery.rebuildIsDue(at: 100), "nothing is rebuilt while asleep")
+
+        // A rebuild issued before the sleep reports it started, its levels
+        // never arrive, and listeners keep invalidating it.
+        var now: TimeInterval = 10
+        for _ in 0..<(SystemOutputRecovery.maximumConsecutiveInvalidations * 2) {
+            recovery.started(at: now)
+            now += SystemOutputRecovery.rebuildAfterSilence + 8
+            XCTAssertEqual(recovery.check(at: now), .none, "a sleeping output's silence is not stale")
+            recovery.invalidated(at: now)
+        }
+        XCTAssertEqual(recovery.consecutiveInvalidations, 1, "not counted across the sleep")
+        XCTAssertFalse(recovery.rebuildsExhausted)
+        XCTAssertFalse(recovery.rebuildIsDue(at: now))
+
+        recovery.reset()
+        recovery.serviceRestarted()
+        XCTAssertTrue(recovery.isAsleep, "turning monitoring off or a restart does not end the sleep")
+    }
+
+    func testTheWakeStartsTheCountOverAndDuesOneRebuildAtOnce() {
+        var recovery = SystemOutputRecovery()
+        let now = invalidateInARow(&recovery, count: SystemOutputRecovery.maximumConsecutiveInvalidations)
+        XCTAssertTrue(recovery.rebuildsExhausted)
+        recovery.willSleep()
+
+        recovery.didWake()
+
+        XCTAssertFalse(recovery.isAsleep)
+        XCTAssertEqual(recovery.consecutiveInvalidations, 0)
+        XCTAssertNil(recovery.rebuildNotBefore)
+        XCTAssertTrue(recovery.rebuildIsDue(at: now), "due with no spacing, once the window releases")
+        XCTAssertFalse(recovery.isWatching, "levels are watched again once the rebuild starts")
+
+        recovery.rebuildIssued()
+        recovery.started(at: now + 1)
+        XCTAssertEqual(recovery.check(at: now + 1 + SystemOutputRecovery.rebuildAfterSilence), .rebuild)
+    }
 }

@@ -37,6 +37,25 @@ final class PowerStateLogTests: XCTestCase {
         XCTAssertEqual(lines, ["power will-sleep gen=1", "power did-wake gen=2"])
     }
 
+    func testTheOwnerHearsOfSleepAndWakeAfterTheirLines() {
+        var events: [String] = []
+        HALLifecycleLog.observer = { line in
+            if line.hasPrefix("power ") {
+                events.append(line.components(separatedBy: " ")[1])
+            }
+        }
+        let center = NotificationCenter()
+        let log = PowerStateLog(center: center, holdGeneration: LifecycleHoldGeneration())
+        log.onWillSleep = { events.append("owner-sleep") }
+        log.onDidWake = { events.append("owner-wake") }
+        log.start()
+
+        center.post(name: NSWorkspace.willSleepNotification, object: nil)
+        center.post(name: NSWorkspace.didWakeNotification, object: nil)
+
+        XCTAssertEqual(events, ["will-sleep", "owner-sleep", "did-wake", "owner-wake"])
+    }
+
     func testTheDefaultCenterIsTheWorkspaceCenterThatPostsSleepAndWake() {
         let log = PowerStateLog(holdGeneration: LifecycleHoldGeneration())
         XCTAssertTrue(log.observedCenter === NSWorkspace.shared.notificationCenter)
