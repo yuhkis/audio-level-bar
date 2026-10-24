@@ -10,7 +10,7 @@ Use the section that matches the change. The product and safety boundaries that 
 | UI-independent level calculations | `make test`, the unit tests for those calculations |
 | User-facing text | `make check-localization`, plus an app check when the display or the layout changes |
 | Core Audio, permissions, devices, or volume writes | The automated checks that apply, and the real-device cases below |
-| Build, bundle, signing, or a deployment candidate | `make ci` and candidate verification, plus real-device checks for the behavior the candidate changes |
+| Build, bundle, signing, or a deployment candidate | `make ci` and candidate verification, plus real-device checks for the behavior the candidate changes; for the release script, a `make release` rehearsal and its summary |
 
 `make ci` builds the app bundle, so the build-number rule below applies to it whatever the change was; read that section before running it in a checkout that still holds a candidate in `dist/`.
 
@@ -281,6 +281,50 @@ osascript -e 'tell application id "io.github.yuhkis.audio-level-bar" to quit'
 ```
 
 Never force quit while the processed microphone is published; that is one of the ways to leave Core Audio wedged for the whole machine.
+
+### Release builds
+
+`make release` (`scripts/release-app.sh`) builds what is handed to other people: `dist/release/Audio Level Bar-<version>.dmg` and its `.sha256`. The tag and the GitHub Release are the maintainer's decision, made after the hardware gate has passed.
+
+1. Pass the hardware gate on a `make app` candidate. The release is compiled again with other flags and stripped, so it is not byte for byte the candidate the gate ran on. It must be built from a commit whose app sources match the gated candidate's: when the gated commit predates `make release`, check that `git diff <gated commit> <release commit> -- Sources Resources Package.swift Vendor ThirdParty` prints nothing.
+2. Build the release on a clean tree with the Developer ID certificate and the notary profile:
+
+   ```console
+   env CODESIGN_IDENTITY='<name of your Developer ID Application certificate>' NOTARY_PROFILE='<profile name>' make release
+   ```
+
+3. The summary at the end must say `Distributable: yes`. Confirm with `codesign -dv --verbose=4 "dist/release/Audio Level Bar.app"` that the authority is the certificate issued to you.
+4. Install from the disk image as a release user would: open it, drag the app to Applications, launch it, and check the microphone permission prompt and the meters. Then upload the `.dmg` and its `.sha256` to a draft release, download them on a Mac or a user account that did not build them, and open them there before publishing the release. The script cannot check how Gatekeeper treats a download that carries the quarantine attribute.
+
+One-time setup, kept out of the repository:
+
+- Membership of the Apple Developer Program, and a Developer ID Application certificate with its private key in the login keychain. `security find-identity -v -p codesigning` lists it; `CODESIGN_IDENTITY` takes its full name or its SHA-1.
+- A notarytool keychain profile, created with `xcrun notarytool store-credentials '<profile name>'` and either `--apple-id`, `--team-id` and an app-specific password, or an App Store Connect API key (`--key`, `--key-id`, `--issuer`). Only the profile name goes into `NOTARY_PROFILE`; the credentials stay in the keychain.
+
+| Setting | Effect |
+| --- | --- |
+| `CODESIGN_IDENTITY` | The certificate for the app and the disk image. Unset, both are signed ad hoc and the summary says the result is not distributable |
+| `NOTARY_PROFILE` | The notarytool keychain profile. Unset, nothing is submitted and the summary says the result is not notarized. Set without `CODESIGN_IDENTITY`, the release is refused |
+| `RELEASE_FLAGS=--zip` | A ZIP archive instead of the disk image; `--dmg --zip` makes both |
+| `RELEASE_FLAGS=--allow-dirty` | Builds from uncommitted changes, for a rehearsal; the bundle records `dirty` and the summary says the result is not distributable |
+| `ALB_PRIVATE_PATTERNS` | The pattern list the scanner reads, as for the Git hooks |
+
+The checks, in order. Any failure stops the release, removes the disk image, archive, and checksums that run made, and leaves only the bundle in `dist/release/` for inspection; a refusal before the build leaves the previous run's output alone.
+
+1. **Preconditions.** The scanner is present and executable. The private pattern list exists and holds at least one value: a scan of the generic shapes alone has not checked the values this Mac must never publish, so the release stops there. The working tree is clean, unless `--allow-dirty` is given. `NOTARY_PROFILE` is not set without `CODESIGN_IDENTITY`.
+2. **Build.** `scripts/build-app.sh` with `AUDIO_LEVEL_BAR_DISTRIBUTION=true` and `AUDIO_LEVEL_BAR_APP_BUNDLE`, writing `dist/release/Audio Level Bar.app` and using `.build/distribution` as its scratch directory. The Swift and C compilers get `-file-prefix-map` for the project directory, both as given and as its physical path, and the executable is stripped of its debug symbol entries and local symbols (`strip -S -x`) before it is signed. The linker's debug map names every source and object file by its absolute path, and no compiler flag reaches it, so the strip is what removes those paths; the global symbols stay, so that a crash report remains readable without a dSYM.
+3. **Path removal.** The executable must hold no `/Users/` path, no SO or OSO debug symbol entry, and no occurrence of the project or scratch directory. The log prints the three counts.
+4. **Notarization of the app**, with `NOTARY_PROFILE`. The bundle is submitted as a ZIP with `xcrun notarytool submit --keychain-profile "$NOTARY_PROFILE" --wait`, must come back `Accepted` (otherwise the notary log is printed and the release stops), and is stapled and validated with `xcrun stapler`.
+5. **Bundle verification.** `scripts/verify-app.sh` on the final bundle: identity, provenance, signature, hardened runtime and entitlement, localizations, and licenses.
+6. **Private-content scan.** `scripts/scan-private-content.sh` over every name in the bundle, and over the contents of every file, one file at a time so that a hit names the file. A Mach-O file is scanned with its code signature removed, and the ticket stapled at `Contents/CodeResources` is left out, because `codesign` and Apple write those rather than the build. One hit stops the release before anything is packaged.
+7. **Signature report**, not a gate. The code signature and the stapled ticket are scanned on their own. A certificate signature carries the certificate chain, so a Developer ID signature names the signer and the Team ID: that is what Developer ID distribution publishes. The generic certificate-subject pattern always matches it, and so does a Team ID kept in the pattern list. The log shows which reasons and pattern-list lines matched, never the values.
+8. **Gatekeeper.** `spctl --assess --type execute` for the app, and `spctl --assess --type open --context context:primary-signature` for the disk image. With `NOTARY_PROFILE`, both must accept the file as `Notarized Developer ID`; without it the result is shown for information.
+9. **Disk image.** `hdiutil create` (HFS+, UDZO) from a folder holding the app and a symbolic link to `/Applications`, signed with the same identity and a secure timestamp, then notarized and stapled with `NOTARY_PROFILE`. It is mounted read-only to check that it holds only the app and the link, that its file names pass the scanner, and that the app passes `verify-app.sh` and has the scanned bundle's content fingerprint.
+10. **ZIP archive**, with `--zip`. `ditto -c -k --keepParent`; its file names are scanned, and it is extracted, verified, and compared with the scanned bundle in the same way. The archive itself is not signed; the app inside it is, with its stapled ticket.
+11. **Checksums.** A `.sha256` file beside each package, checked with `shasum -a 256 -c`.
+12. **Summary.** Version, build, commit and state, the path and scan results, the kind of signature (ad hoc, Developer ID Application, or another certificate; the certificate subject itself is not printed), the notarization result, and the checksums. It ends with `Distributable: yes` only for a clean tree signed with Developer ID and notarized, and otherwise lists what is missing.
+
+`dist/` stays git-ignored, and nothing under `dist/release/` is committed. The disk image and its `.sha256` are the only files to upload.
 
 ## Localization
 

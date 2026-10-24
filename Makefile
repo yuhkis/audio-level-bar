@@ -1,6 +1,8 @@
-.PHONY: build test diagnose app verify-app install install-login-agent run ci lint-metadata check-localization verify-vendor vendor-smoke setup-dev audit-history
+.PHONY: build test diagnose app verify-app install install-login-agent release run ci lint-metadata check-localization verify-vendor vendor-smoke setup-dev audit-history
 
 APP_PATH := $(CURDIR)/dist/Audio Level Bar.app
+# make release RELEASE_FLAGS=--zip packages a ZIP archive instead of the disk image.
+RELEASE_FLAGS :=
 
 build:
 	swift build
@@ -22,6 +24,9 @@ install:
 
 install-login-agent:
 	./scripts/install-login-agent.sh
+
+release:
+	./scripts/release-app.sh $(RELEASE_FLAGS)
 
 setup-dev:
 	./scripts/setup-dev.sh
