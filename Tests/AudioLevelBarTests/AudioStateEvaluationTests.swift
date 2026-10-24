@@ -145,7 +145,7 @@ final class AudioStateEvaluationTests: XCTestCase {
 
     // MARK: Quit
 
-    func testQuitStopsThePublisherWithdrawsThePublicationThenStopsTheMetersAndWaitsForThem() {
+    func testQuitSilencesThePublisherWithdrawsThePublicationThenStopsTheMetersAndWaitsForThem() {
         let harness = AudioStateHarness(systemOutputMonitoring: true, processedMicrophone: true)
         defer { harness.tearDown() }
         harness.launchAndPublish()
@@ -158,8 +158,11 @@ final class AudioStateEvaluationTests: XCTestCase {
         // The withdrawal takes a while on the main thread. A stop handed to a
         // lifecycle queue before it would run meanwhile.
         let publishedAggregate = AudioStateHarness.publishedAggregate
+        let engine = harness.state.processedMicrophoneEngineForTesting
+        var gateOpenAtWithdrawal: Bool?
         harness.holds.onEnter = { point in
             if point == .hal(.destroyAggregate(publishedAggregate)) {
+                gateOpenAtWithdrawal = engine.livePublisherContextForTesting?.close() ?? false
                 usleep(100_000)
             }
         }
@@ -178,7 +181,8 @@ final class AudioStateEvaluationTests: XCTestCase {
             }
         }
         guard
-            let publisherStop = line("processed-microphone-publisher-engine stop ", containing: "reason=quit"),
+            let publisherStop = line("processed-microphone-publisher-ioproc stop ", containing: "reason=quit"),
+            let publisherDestroy = timeline.firstIndex(of: .call(.destroyIOProc(AudioStateHarness.speakers))),
             let aggregateWithdrawal = timeline.firstIndex(of: .call(.destroyAggregate(publishedAggregate))),
             let tapWithdrawal = timeline.firstIndex(of: .call(.destroyProcessTap(AudioStateHarness.publishedTap))),
             let systemOutputStop = timeline.firstIndex(of: .call(.stop(AudioStateHarness.systemOutputAggregate))),
@@ -190,7 +194,10 @@ final class AudioStateEvaluationTests: XCTestCase {
         else {
             return XCTFail("a Quit step is missing: \(timeline)")
         }
-        XCTAssertLessThan(publisherStop, aggregateWithdrawal, "the publisher stops before its muted tap is withdrawn")
+        XCTAssertEqual(gateOpenAtWithdrawal, false, "the publisher renders silence before its muted tap is withdrawn")
+        XCTAssertLessThan(publisherStop, publisherDestroy)
+        XCTAssertLessThan(publisherDestroy, wait, "Quit waits for the publisher's release")
+        _ = aggregateWithdrawal
         XCTAssertLessThan(tapWithdrawal, systemOutputStop, "the meters' stops are handed over after the withdrawal")
         XCTAssertLessThan(systemOutputTapDestroy, wait, "Quit waits for the system playback meter's release")
         XCTAssertLessThan(captureDestroy, wait, "and for the capture's")

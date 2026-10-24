@@ -70,6 +70,20 @@ final class FakeHALLifecycleCalls: HALLifecycleCalls, @unchecked Sendable {
     private var _deviceListStatus: OSStatus = noErr
     private var _inputStreamCount: (status: OSStatus, count: Int) = (noErr, 1)
     private var _transports: [AudioObjectID: AudioDeviceTransportInfo?] = [:]
+    private var _createStatuses: [AudioObjectID: OSStatus] = [:]
+    private var _startStatuses: [AudioObjectID: OSStatus] = [:]
+
+    /// What the next IOProc create on `deviceID` returns, once; `noErr`
+    /// unless set.
+    func failNextCreateIOProc(on deviceID: AudioObjectID, with status: OSStatus) {
+        withLock { _createStatuses[deviceID] = status }
+    }
+
+    /// What the next `start` on `deviceID` returns, once, instead of
+    /// `startStatus`.
+    func failNextStart(on deviceID: AudioObjectID, with status: OSStatus) {
+        withLock { _startStatuses[deviceID] = status }
+    }
 
     /// The calls whose status a test can override.
     enum StatusKey: Hashable {
@@ -88,6 +102,7 @@ final class FakeHALLifecycleCalls: HALLifecycleCalls, @unchecked Sendable {
     enum Read: Equatable {
         case transportInfo(AudioObjectID)
         case inputStreamFormat(AudioObjectID)
+        case outputStreamFormat(AudioObjectID)
         case defaultInputDeviceID
         case defaultOutputDeviceID
         case processObjectID
@@ -284,12 +299,13 @@ final class FakeHALLifecycleCalls: HALLifecycleCalls, @unchecked Sendable {
         block: @escaping AudioDeviceIOBlock
     ) -> (status: OSStatus, ioProcID: AudioDeviceIOProcID?) {
         let ioProcID = makeIOProcID()
+        let status = withLock { _createStatuses.removeValue(forKey: deviceID) } ?? noErr
         record(.createIOProc(deviceID))
-        return (noErr, ioProcID)
+        return (status, status == noErr ? ioProcID : nil)
     }
 
     func start(deviceID: AudioObjectID, ioProcID: AudioDeviceIOProcID) -> OSStatus {
-        let status = startStatus
+        let status = withLock { _startStatuses.removeValue(forKey: deviceID) } ?? startStatus
         record(.start(deviceID))
         return status
     }
@@ -391,9 +407,37 @@ final class FakeHALLifecycleCalls: HALLifecycleCalls, @unchecked Sendable {
         }
     }
 
-    func inputStreamFormat(for deviceID: AudioObjectID) -> InputStreamFormat? {
+    func inputStreamFormat(for deviceID: AudioObjectID) -> DeviceStreamFormat? {
         noteRead(.inputStreamFormat(deviceID))
-        return InputStreamFormat(sampleFormat: .float32, channelCount: 1, sampleRate: 48_000)
+        return DeviceStreamFormat(sampleFormat: .float32, channelCount: 1, sampleRate: 48_000)
+    }
+
+    private var _outputStreamFormat: DeviceStreamFormat? = DeviceStreamFormat(
+        sampleFormat: .float32,
+        channelCount: 2,
+        sampleRate: 48_000
+    )
+
+    /// What `outputStreamFormat(for:)` reads, for every device; nil reads as
+    /// a device with no usable output format. Float32 stereo at 48 kHz by
+    /// default.
+    var outputStreamFormatRead: DeviceStreamFormat? {
+        get { withLock { _outputStreamFormat } }
+        set { withLock { _outputStreamFormat = newValue } }
+    }
+
+    private var _outputFormatReads: [AudioObjectID] = []
+
+    /// The devices `outputStreamFormat(for:)` was read for, in order: one for
+    /// each publisher start that got as far as its format read.
+    var outputFormatReads: [AudioObjectID] {
+        withLock { _outputFormatReads }
+    }
+
+    func outputStreamFormat(for deviceID: AudioObjectID) -> DeviceStreamFormat? {
+        withLock { _outputFormatReads.append(deviceID) }
+        noteRead(.outputStreamFormat(deviceID))
+        return outputStreamFormatRead
     }
 
     func maximumBufferFrameSize(for deviceID: AudioObjectID) -> Int? {

@@ -24,6 +24,7 @@
 "Another app is still using it. Choosing a different microphone in that app turns this off" = "別のアプリが使用中です。そのアプリで別のマイクを選ぶとオフになります";
 "Another app is using “%@”, so publication cannot be withdrawn. Choosing a different microphone in that app releases it." = "他のアプリが「%@」を使用中のため、公開を解除できません。そのアプリで別のマイクを選ぶと解除されます。";
 "Apple provides echo cancellation and noise suppression (no AGC); WebRTC provides noise suppression only. When comparing them, turn off the consuming app’s own processing so it is not applied twice." = "Appleはエコーキャンセリングとノイズ抑制（AGCなし）、WebRTCはノイズ抑制のみです。比較時は使用先アプリの音声処理をオフにし、二重適用を避けてください。";
+"WebRTC provides noise suppression only. Turn off the consuming app’s own noise suppression so it is not applied twice." = "WebRTCはノイズ抑制のみです。使用先アプリのノイズ抑制をオフにし、二重適用を避けてください。";
 "Apple voice processing" = "Apple音声処理";
 "Audio Level Bar could not exclude itself from system playback monitoring." = "Audio Level Bar自身をシステム再生監視から除外できませんでした。";
 "Audio Level Bar — Speaker muted. Top: speaker volume setting. Bottom: microphone input level (white line: input gain)" = "Audio Level Bar — スピーカーはミュート中。上：スピーカー設定音量、下：マイク入力レベル（白線：入力ゲイン）";
@@ -181,7 +182,6 @@
 "Processing is paused because there is no built-in or other non-Bluetooth output to render it to. “Audio Level Bar Microphone” stays available and sends silence until there is." = "内蔵出力などBluetooth以外の出力がないため、処理を一時停止しています。「Audio Level Bar Microphone」は引き続き利用でき、そうした出力が使えるようになるまで無音を送ります。";
 "The processed microphone does not start without a built-in or other non-Bluetooth output. It renders its audio, muted, to such an output rather than to a Bluetooth headset. It starts once one is available." = "内蔵出力などBluetooth以外の出力がない間は、加工済みマイクを開始しません。加工した音声は、Bluetoothヘッドセットではなく、そうした出力へ消音して描画するためです。そうした出力が使えるようになると開始します。";
 "Selecting the processed microphone input and output devices" = "加工済みマイクの入力と出力のデバイスの選択";
-"Selecting the processed microphone output device" = "加工済みマイクの出力デバイスの選択";
 "Creating the processed microphone capture IOProc" = "加工済みマイクの取り込みIOProcの作成";
 "Core Audio has not finished starting the microphone level meter. If other audio apps have stopped responding too, Core Audio itself is not answering, and only restarting the Mac recovers it." = "Core Audioがマイクレベルメーターの開始を完了していません。他の音声アプリも応答しない場合はCore Audio自体が応答しておらず、復旧にはMacの再起動が必要です。";
 "Core Audio has not finished starting or stopping system playback level monitoring. If other audio apps have stopped responding too, Core Audio itself is not answering, and only restarting the Mac recovers it." = "Core Audioがシステム再生レベル監視の開始または停止を完了していません。他の音声アプリも応答しない場合はCore Audio自体が応答しておらず、復旧にはMacの再起動が必要です。";

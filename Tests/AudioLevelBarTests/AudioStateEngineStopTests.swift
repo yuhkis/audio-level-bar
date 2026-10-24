@@ -56,9 +56,7 @@ final class AudioStateEngineStopTests: XCTestCase {
         line.flatMap { AudioStateHarness.field("gen", of: $0) }
     }
 
-    private func lastOperation(of publisher: FakePublisherEngine) -> FakePublisherEngine.Call? {
-        publisher.calls.last { $0 != .readBoundOutput }
-    }
+    private let speakers = AudioStateHarness.speakers
 
     /// The begin lines a quiet window holds, judged as the gate's criterion
     /// 10 judges them: a generation below the highest held or advanced so
@@ -106,9 +104,7 @@ final class AudioStateEngineStopTests: XCTestCase {
     func testAStopIssuedAfterAListenerAdvancedTheGenerationStopsNothingUntilTheNextRelease() {
         let harness = runningHarness(mode: .off)
         defer { harness.tearDown() }
-        guard let publisher = harness.publisherEngines.engines.last else {
-            return XCTFail("no publisher was built")
-        }
+        XCTAssertEqual(harness.lastPublisherCall, .start(speakers), "the publisher runs on the built-in output")
         // A change arms the window, and the feature is switched off inside
         // it while the consuming app keeps the device open: the release
         // stops the engines and keeps the publication.
@@ -127,22 +123,20 @@ final class AudioStateEngineStopTests: XCTestCase {
         XCTAssertEqual(
             Array(harness.hal.calls.dropFirst(before)),
             [],
-            "neither the IOProc's listeners, its stop nor its destroy reach the HAL inside the window"
+            "neither IOProc's listeners, stop nor destroy reach the HAL inside the window"
         )
-        XCTAssertEqual(lastOperation(of: publisher), .start, "the publisher is not stopped inside the window")
-        XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-publisher-engine stop").isEmpty)
+        XCTAssertEqual(harness.lastPublisherCall, .start(speakers), "the publisher is not stopped inside the window")
+        XCTAssertEqual(
+            harness.state.processedMicrophoneEngineForTesting.livePublisherContextForTesting?.close(),
+            false,
+            "its gate is closed, so it renders silence"
+        )
+        XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-publisher-ioproc stop").isEmpty)
         XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-capture-ioproc stop").isEmpty)
         XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-capture-ioproc destroy").isEmpty)
-        let publisherInterrupt = harness.lines(withPrefix: "processed-microphone-publisher-engine interrupt-stop ")
-        XCTAssertEqual(publisherInterrupt.count, 1, "\(publisherInterrupt)")
-        XCTAssertEqual(generation(of: publisherInterrupt.first), issuedIn, "the generation the evaluation saw")
-        XCTAssertEqual(
-            publisherInterrupt.first.flatMap { AudioStateHarness.field("id", of: $0) },
-            "\(AudioStateHarness.speakers)"
-        )
         let captureInterrupt = harness.lines(withPrefix: "processed-microphone-capture-ioproc interrupt-stop ")
         XCTAssertEqual(captureInterrupt.count, 1, "\(captureInterrupt)")
-        XCTAssertEqual(generation(of: captureInterrupt.first), issuedIn)
+        XCTAssertEqual(generation(of: captureInterrupt.first), issuedIn, "the generation the evaluation saw")
         XCTAssertTrue(
             harness.state.processedMicrophoneEngineForTesting.retiredEnginesForTesting.isEmpty,
             "nothing is retired, so nothing can be freed inside the window"
@@ -154,18 +148,17 @@ final class AudioStateEngineStopTests: XCTestCase {
         harness.advance(by: 1)
         harness.poll()
         XCTAssertEqual(Array(harness.hal.calls.dropFirst(before)), [])
-        XCTAssertEqual(lastOperation(of: publisher), .start)
 
         passWindow(harness)
 
         XCTAssertEqual(
             captureReleases(harness, after: before),
             [.stop(microphone), .destroyIOProc(microphone)],
-            "the release after the window stops and destroys the IOProc"
+            "the release after the window stops and destroys the capture IOProc"
         )
         XCTAssertEqual(publicationCalls(harness, after: before), [], "and keeps the publication, which is in use")
-        XCTAssertEqual(lastOperation(of: publisher), .stop, "and stops the publisher")
-        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-publisher-engine stop ").count, 1)
+        XCTAssertEqual(harness.lastPublisherCall, .destroyIOProc(speakers), "and releases the publisher")
+        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-publisher-ioproc stop ").count, 1)
         XCTAssertFalse(harness.state.processedMicrophoneEngineForTesting.isRunning, "nothing is left running")
         XCTAssertEqual(beginLinesInsideAWindow(harness), [])
         XCTAssertEqual(harness.state.processedMicrophoneState, .awaitingRelease)
@@ -174,11 +167,8 @@ final class AudioStateEngineStopTests: XCTestCase {
     func testAnAppleVoiceProcessingStopIsHeldBackTheSameWay() {
         let harness = runningHarness(mode: .apple)
         defer { harness.tearDown() }
-        guard
-            let capture = harness.voiceProcessingEngines.engines.last,
-            let publisher = harness.publisherEngines.engines.last
-        else {
-            return XCTFail("the engines were not built")
+        guard let capture = harness.voiceProcessingEngines.engines.last else {
+            return XCTFail("the engine was not built")
         }
         harness.fireSystemNotification(.defaultInput)
         harness.settle()
@@ -190,43 +180,41 @@ final class AudioStateEngineStopTests: XCTestCase {
 
         let issuedIn = generation(of: harness.lines(withPrefix: "quiet-window release ").last)
         XCTAssertEqual(capture.calls.last, .start, "the capture engine is neither stopped nor untapped inside the window")
-        XCTAssertEqual(lastOperation(of: publisher), .start)
+        XCTAssertEqual(harness.lastPublisherCall, .start(speakers))
         XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-voice-processing-engine stop").isEmpty)
-        XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-publisher-engine stop").isEmpty)
-        let interrupts = harness.lines.values.filter { $0.contains("-engine interrupt-stop ") }
-        XCTAssertEqual(interrupts.count, 2, "one line for each engine kept: \(interrupts)")
-        XCTAssertEqual(interrupts.first?.hasPrefix("processed-microphone-voice-processing-engine "), true)
-        XCTAssertEqual(interrupts.first.flatMap { AudioStateHarness.field("id", of: $0) }, "\(microphone)")
-        for line in interrupts {
+        XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-publisher-ioproc stop").isEmpty)
+        let engineInterrupts = harness.lines(withPrefix: "processed-microphone-voice-processing-engine interrupt-stop ")
+        XCTAssertEqual(engineInterrupts.count, 1, "\(engineInterrupts)")
+        XCTAssertEqual(engineInterrupts.first.flatMap { AudioStateHarness.field("id", of: $0) }, "\(microphone)")
+        let publisherInterrupts = harness.lines(withPrefix: "processed-microphone-publisher-ioproc interrupt-stop ")
+        XCTAssertEqual(publisherInterrupts.count, 1, "\(publisherInterrupts)")
+        for line in engineInterrupts + publisherInterrupts {
             XCTAssertEqual(generation(of: line), issuedIn, line)
         }
 
         passWindow(harness)
 
         XCTAssertEqual(Array(capture.calls.suffix(2)), [.stop, .removeTap], "the release after the window stops it")
-        XCTAssertEqual(lastOperation(of: publisher), .stop)
+        XCTAssertEqual(harness.lastPublisherCall, .destroyIOProc(speakers))
         XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-voice-processing-engine stop ").count, 1)
-        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-publisher-engine stop ").count, 1)
+        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-publisher-ioproc stop ").count, 1)
         XCTAssertFalse(harness.state.processedMicrophoneEngineForTesting.isRunning)
         XCTAssertEqual(beginLinesInsideAWindow(harness), [])
     }
 
-    func testAWindowThatArmsInsideTheCaptureEnginesStopHoldsThePublishersStopBack() {
+    func testAWindowThatArmsInsideTheCaptureEnginesStopHoldsThePublishersReleaseBack() {
         let harness = runningHarness(mode: .apple)
         defer { harness.tearDown() }
-        guard
-            let capture = harness.voiceProcessingEngines.engines.last,
-            let publisher = harness.publisherEngines.engines.last
-        else {
-            return XCTFail("the engines were not built")
+        guard let capture = harness.voiceProcessingEngines.engines.last else {
+            return XCTFail("the engine was not built")
         }
         harness.fireSystemNotification(.defaultInput)
         harness.settle()
         harness.state.setProcessedMicrophoneEnabled(false)
         harness.settle()
-        // Apple voice processing has two engine stops behind the release.
-        // The capture engine's waits in coreaudiod, and a listener advances
-        // the generation before it returns.
+        // The capture engine's stop waits in coreaudiod, and a listener
+        // advances the generation before it returns. The publisher's release
+        // is issued after it.
         var fired = false
         let noted = capture.onCall
         capture.onCall = { [unowned harness] call in
@@ -242,23 +230,22 @@ final class AudioStateEngineStopTests: XCTestCase {
 
         let issuedIn = generation(of: harness.lines(withPrefix: "quiet-window release ").last)
         XCTAssertEqual(Array(capture.calls.suffix(2)), [.stop, .removeTap], "the stop already issued runs to its end")
-        XCTAssertEqual(lastOperation(of: publisher), .start, "the publisher's stop is not made inside the window")
-        XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-publisher-engine stop").isEmpty)
-        let interrupts = harness.lines.values.filter { $0.contains("-engine interrupt-stop ") }
+        XCTAssertEqual(harness.lastPublisherCall, .start(speakers), "the publisher's release is not made inside the window")
+        XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-publisher-ioproc stop").isEmpty)
+        let interrupts = harness.lines(withPrefix: "processed-microphone-publisher-ioproc interrupt-stop ")
         XCTAssertEqual(interrupts.count, 1, "\(interrupts)")
-        XCTAssertEqual(interrupts.first?.hasPrefix("processed-microphone-publisher-engine "), true)
         XCTAssertEqual(generation(of: interrupts.first), issuedIn)
         XCTAssertEqual(
             publicationCalls(harness, after: before),
             [],
-            "and the muted tap is not withdrawn under a publisher that still renders"
+            "and the publication is not withdrawn inside the window"
         )
         XCTAssertTrue(harness.state.processedMicrophoneEngineForTesting.isRunning, "a restart is owed")
 
         passWindow(harness)
 
-        XCTAssertEqual(lastOperation(of: publisher), .stop, "the release after the window stops it")
-        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-publisher-engine stop ").count, 1)
+        XCTAssertEqual(harness.lastPublisherCall, .destroyIOProc(speakers), "the release after the window releases it")
+        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-publisher-ioproc stop ").count, 1)
         XCTAssertEqual(capture.calls.filter { $0 == .stop }.count, 1, "the capture engine is not stopped twice")
         XCTAssertFalse(harness.state.processedMicrophoneEngineForTesting.isRunning)
         XCTAssertEqual(beginLinesInsideAWindow(harness), [])
@@ -284,17 +271,14 @@ final class AudioStateEngineStopTests: XCTestCase {
         }
         harness.setPublishedDeviceInUse(true)
         harness.settle()
-        guard
-            let capture = harness.voiceProcessingEngines.engines.first,
-            let publisher = harness.publisherEngines.engines.first
-        else {
-            return XCTFail("the engines were not built")
+        guard let capture = harness.voiceProcessingEngines.engines.first else {
+            return XCTFail("the engine was not built")
         }
 
         XCTAssertEqual(Array(capture.calls.suffix(2)), [.stop, .removeTap])
-        XCTAssertEqual(lastOperation(of: publisher), .start, "the publisher's stop is not made inside the window")
-        XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-publisher-engine stop").isEmpty)
-        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-publisher-engine interrupt ").count, 1)
+        XCTAssertEqual(harness.lastPublisherCall, .start(speakers), "the publisher's release is not made inside the window")
+        XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-publisher-ioproc stop").isEmpty)
+        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-publisher-ioproc interrupt ").count, 1)
         XCTAssertEqual(
             harness.state.microphoneProcessingMode,
             .apple,
@@ -303,17 +287,17 @@ final class AudioStateEngineStopTests: XCTestCase {
 
         passWindow(harness)
 
-        XCTAssertEqual(lastOperation(of: publisher), .stop, "the release after the window stops the kept publisher")
-        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-publisher-engine stop ").count, 1)
+        XCTAssertEqual(
+            harness.lines(withPrefix: "processed-microphone-publisher-ioproc stop ").count,
+            1,
+            "the release after the window stops the kept publisher"
+        )
         XCTAssertEqual(beginLinesInsideAWindow(harness), [])
     }
 
-    func testThePublicationIsNotWithdrawnUnderAPublisherWhoseStopWasHeldBack() {
+    func testThePublicationIsWithdrawnOnlyOutsideTheWindowAndOnlyOnceThePublisherIsSilent() {
         let harness = runningHarness(mode: .off)
         defer { harness.tearDown() }
-        guard let publisher = harness.publisherEngines.engines.last else {
-            return XCTFail("no publisher was built")
-        }
         // Inside a window, the consuming app closes the device and the
         // feature is switched off: the release owes the whole teardown, the
         // engines' stop and then the publication's withdrawal.
@@ -332,11 +316,22 @@ final class AudioStateEngineStopTests: XCTestCase {
         XCTAssertEqual(
             harness.lifecycleCalls(after: before),
             [],
-            "the muted tap and its aggregate device are not destroyed under a publisher that still renders"
+            "neither the IOProcs nor the muted tap and its aggregate device are touched inside the window"
         )
-        XCTAssertEqual(lastOperation(of: publisher), .start)
+        XCTAssertEqual(harness.lastPublisherCall, .start(speakers))
+
+        // At the withdrawal, the publisher renders nothing but silence.
+        let engine = harness.state.processedMicrophoneEngineForTesting
+        var gateOpenAtWithdrawal: Bool?
+        let aggregate = aggregate
+        harness.holds.onEnter = { point in
+            if point == .hal(.destroyAggregate(aggregate)), gateOpenAtWithdrawal == nil {
+                gateOpenAtWithdrawal = engine.livePublisherContextForTesting?.close() ?? false
+            }
+        }
 
         passWindow(harness)
+        harness.holds.onEnter = nil
 
         XCTAssertEqual(
             captureReleases(harness, after: before),
@@ -347,65 +342,48 @@ final class AudioStateEngineStopTests: XCTestCase {
             publicationCalls(harness, after: before),
             [.destroyAggregate(aggregate), .destroyProcessTap(tap)]
         )
-        XCTAssertEqual(lastOperation(of: publisher), .stop)
-        let publisherStop = harness.timelineIndex(ofLineWithPrefix: "processed-microphone-publisher-engine stop ")
-        let withdrawal = harness.timelineIndex(of: .destroyAggregate(aggregate))
-        XCTAssertNotNil(publisherStop)
-        XCTAssertNotNil(withdrawal)
-        if let publisherStop, let withdrawal {
-            XCTAssertLessThan(publisherStop, withdrawal, "the publisher stops before its muted tap goes")
-        }
+        XCTAssertEqual(gateOpenAtWithdrawal, false, "the publisher's gate is closed before its muted tap goes")
+        XCTAssertEqual(harness.lastPublisherCall, .destroyIOProc(speakers))
         XCTAssertEqual(beginLinesInsideAWindow(harness), [])
         XCTAssertEqual(harness.state.processedMicrophoneState, .disabled)
     }
 
-    // MARK: A publisher build that fails after the generation advanced
+    // MARK: A publisher that fails after the generation advanced
 
-    /// Launches with `mode` and publishes. The first publisher engine made
-    /// from then on reads back another output than the one it was bound to,
-    /// an ordinary failure of the build, and a default-input listener fires
-    /// inside its bind, after the build's check before that bind has passed.
-    private func failingBuildHarness(
+    /// Launches with `mode` and publishes. The first publisher IOProc create
+    /// fails, an ordinary failure, and a default-input listener fires inside
+    /// it, after the publisher's check before the create has passed.
+    private func failingPublisherHarness(
         mode: MicrophoneProcessingMode,
         file: StaticString = #filePath,
         line: UInt = #line
     ) -> AudioStateHarness {
         let harness = AudioStateHarness(processedMicrophone: true, processingMode: mode)
         harness.launchAndPublish(file: file, line: line)
-        var first = true
-        harness.publisherEngines.prepare = { [unowned harness] publisher in
-            guard first else {
+        harness.hal.failNextCreateIOProc(on: AudioStateHarness.speakers, with: kAudioHardwareUnspecifiedError)
+        var fired = false
+        let speakers = speakers
+        harness.holds.onEnter = { [unowned harness] point in
+            guard point == .hal(.createIOProc(speakers)), !fired else {
                 return
             }
-            first = false
-            publisher.readBack = AudioStateHarness.usbOutput
-            var fired = false
-            publisher.onCall = { call in
-                guard case .bindOutput = call, !fired else {
-                    return
-                }
-                fired = true
-                harness.fireSystemNotification(.defaultInput)
-            }
+            fired = true
+            harness.fireSystemNotification(.defaultInput)
         }
         return harness
     }
 
-    func testAPublisherBuildThatFailsAfterTheGenerationAdvancedKeepsTheIOProcAndTheMode() {
-        let harness = failingBuildHarness(mode: .webRTCLow)
+    func testAPublisherThatFailsAfterTheGenerationAdvancedKeepsTheIOProcAndTheMode() {
+        let harness = failingPublisherHarness(mode: .webRTCLow)
         defer { harness.tearDown() }
         let before = harness.hal.calls.count
 
         harness.setPublishedDeviceInUse(true)
         harness.settle()
 
-        guard let publisher = harness.publisherEngines.engines.first else {
-            return XCTFail("no publisher was built")
-        }
-        XCTAssertFalse(publisher.calls.contains(.prepare), "the build failed at its bind")
         XCTAssertEqual(
             harness.lifecycleCalls(after: before),
-            [.stop(microphone), .destroyIOProc(microphone), .createIOProc(microphone)],
+            [.stop(microphone), .destroyIOProc(microphone), .createIOProc(microphone), .createIOProc(speakers)],
             "the meter hands the input over, and the IOProc created for the start is not destroyed inside the window"
         )
         XCTAssertEqual(
@@ -420,7 +398,6 @@ final class AudioStateEngineStopTests: XCTestCase {
             generation(of: harness.lines(withPrefix: "processed-microphone-capture-ioproc create ").last),
             "the generation the start was issued in"
         )
-        XCTAssertNil(interrupt.first.flatMap { AudioStateHarness.field("reason", of: $0) })
         XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-capture-ioproc destroy").isEmpty)
         XCTAssertEqual(harness.state.microphoneProcessingMode, .webRTCLow, "not a failure of the mode")
         XCTAssertNil(harness.state.microphoneProcessingMessage)
@@ -445,23 +422,17 @@ final class AudioStateEngineStopTests: XCTestCase {
             ["destroy-begin", "create-begin", "start-begin"],
             "the kept, unstarted capture is destroyed before its replacement is created and started: \(released)"
         )
-        XCTAssertEqual(harness.publisherEngines.engines.count, 2, "and starts again")
+        XCTAssertEqual(harness.publisherCreates, 2, "and starts again")
         XCTAssertEqual(harness.state.microphoneProcessingMode, .webRTCLow)
         XCTAssertEqual(harness.state.processedMicrophoneState, .active)
         XCTAssertEqual(beginLinesInsideAWindow(harness), [])
     }
 
-    func testAPublisherBuildThatFailsWithNoWindowArmedStillTurnsTheModeOff() {
+    func testAPublisherThatFailsWithNoWindowArmedStillTurnsTheModeOff() {
         let harness = AudioStateHarness(processedMicrophone: true, processingMode: .webRTCLow)
         defer { harness.tearDown() }
         harness.launchAndPublish()
-        var first = true
-        harness.publisherEngines.prepare = { publisher in
-            if first {
-                first = false
-                publisher.readBack = AudioStateHarness.usbOutput
-            }
-        }
+        harness.hal.failNextCreateIOProc(on: AudioStateHarness.speakers, with: kAudioHardwareUnspecifiedError)
 
         harness.setPublishedDeviceInUse(true)
         harness.settle()
@@ -476,30 +447,28 @@ final class AudioStateEngineStopTests: XCTestCase {
         )
     }
 
-    func testAFailedPublisherStartWhoseStopTheWindowArmsInKeepsTheIOProcAndDoesNotHalt() {
+    func testAFailedPublisherStartWhoseReleaseTheWindowArmsInKeepsTheIOProcsAndDoesNotHalt() {
         let harness = AudioStateHarness(processedMicrophone: true, processingMode: .off)
         defer { harness.tearDown() }
         harness.launchAndPublish()
-        var first = true
-        harness.publisherEngines.prepare = { [unowned harness] publisher in
-            guard first else {
+        harness.hal.failNextStart(on: AudioStateHarness.speakers, with: -10_868)
+        // The failed start is released at once, no window having armed, and
+        // the listener fires while that release reads whether IO runs.
+        var fired = false
+        let speakers = speakers
+        harness.holds.onEnter = { [unowned harness] point in
+            guard point == .hal(.readIsRunning(speakers)), !fired else {
                 return
             }
-            first = false
-            publisher.startError = NSError(domain: NSOSStatusErrorDomain, code: -10_868)
-            // The failed start is stopped at once, no window having armed,
-            // and the listener fires while that stop is on its way.
-            publisher.onCall = { call in
-                if call == .stop {
-                    harness.fireSystemNotification(.defaultInput)
-                }
-            }
+            fired = true
+            harness.fireSystemNotification(.defaultInput)
         }
 
         harness.setPublishedDeviceInUse(true)
         harness.settle()
 
-        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-capture-ioproc interrupt ").count, 1)
+        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-publisher-ioproc interrupt ").count, 1)
+        XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-publisher-ioproc destroy").isEmpty)
         XCTAssertTrue(harness.lines(withPrefix: "processed-microphone-capture-ioproc destroy").isEmpty)
         XCTAssertEqual(harness.state.processedMicrophoneState, .starting, "not halted for a failure a device change caused")
 

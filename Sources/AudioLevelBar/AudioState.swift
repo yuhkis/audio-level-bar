@@ -83,7 +83,7 @@ enum ProcessedMicrophoneState: Equatable {
     case failed(String)
     /// On, but the default input — or for Apple voice processing the default
     /// output — is not a source the app opens by itself, or there is no
-    /// output the publisher engine may be bound to. Nothing is captured.
+    /// output the publisher may be bound to. Nothing is captured.
     /// `published` tells whether an earlier publication stays available,
     /// sending silence, until the source is allowed again.
     case refused(ProcessedMicrophoneRefusal, published: Bool)
@@ -154,6 +154,9 @@ final class AudioState: ObservableObject {
     private static let processedMicrophoneKey = "processedMicrophoneEnabled"
     private static let microphoneProcessingModeKey = "microphoneProcessingMode"
     private static let legacyAppleVoiceProcessingKey = "appleVoiceProcessingEnabled"
+    /// Hidden, read once at launch: whether Apple voice processing is offered
+    /// at all. Off unless set with `defaults write`; see README.
+    static let experimentalAppleVoiceProcessingKey = "experimentalAppleVoiceProcessingEnabled"
     private static let digitalGainKey = "processedMicrophoneDigitalGainDecibels"
 
     @Published private(set) var outputDevices: [AudioDevice] = []
@@ -198,6 +201,15 @@ final class AudioState: ObservableObject {
     @Published private(set) var processedMicrophoneEnabled: Bool
     @Published private(set) var processedMicrophoneState: ProcessedMicrophoneState = .disabled
     @Published private(set) var microphoneProcessingMode: MicrophoneProcessingMode
+    /// Whether Apple voice processing is offered, from the hidden
+    /// `experimentalAppleVoiceProcessingEnabled` setting read at launch.
+    /// Without it, the mode is never Apple voice processing: a saved choice
+    /// of it reads as off, and is kept as saved.
+    let appleVoiceProcessingAvailable: Bool
+    /// The processing modes the picker offers.
+    var availableProcessingModes: [MicrophoneProcessingMode] {
+        MicrophoneProcessingMode.allCases.filter { $0 != .apple || appleVoiceProcessingAvailable }
+    }
     @Published private(set) var microphoneProcessingMessage: String?
     @Published private(set) var digitalGainDecibels: Float
 
@@ -222,7 +234,6 @@ final class AudioState: ObservableObject {
     private let clock: () -> TimeInterval
     private let scheduler: any AudioStateScheduler
     private let microphoneAuthorization: any MicrophoneAuthorization
-    private let makePublisherEngine: () -> any ProcessedMicrophonePublisherEngine
     private let makeVoiceProcessingEngine: () -> any VoiceProcessingCaptureEngine
     private let tapReclaimInventory: OrphanedProcessTapReclaimer.Inventory
     private let powerNotificationCenter: NotificationCenter
@@ -237,7 +248,6 @@ final class AudioState: ObservableObject {
     private lazy var processedMicrophoneEngine = ProcessedMicrophoneEngine(
         halCalls: lifecycleCalls,
         holdGeneration: lifecycleHoldGeneration,
-        makePublisherEngine: makePublisherEngine,
         makeVoiceProcessingEngine: makeVoiceProcessingEngine
     )
     private lazy var processedMicrophoneDevice = PublicProcessedMicrophoneDevice(
@@ -308,7 +318,7 @@ final class AudioState: ObservableObject {
     /// and output with the same transports, so the start is not retried once
     /// per quiet window while the poll and the fresh read disagree.
     private var voiceProcessingRefusal: SourceRefusalLatch?
-    /// The same for the publisher engine's output: the read made immediately
+    /// The same for the publisher's output: the read made immediately
     /// before the engine is built found no output it may be bound to, while
     /// the poll still showed one. It stands while the poll shows the same
     /// default output with the same transport.
@@ -407,7 +417,6 @@ final class AudioState: ObservableObject {
         clock = dependencies.now
         scheduler = dependencies.scheduler
         microphoneAuthorization = dependencies.microphoneAuthorization
-        makePublisherEngine = dependencies.makePublisherEngine
         makeVoiceProcessingEngine = dependencies.makeVoiceProcessingEngine
         tapReclaimInventory = dependencies.tapReclaimInventory
         powerNotificationCenter = dependencies.powerNotificationCenter
@@ -417,23 +426,31 @@ final class AudioState: ObservableObject {
         processedMicrophoneEnabled = defaults.bool(
             forKey: Self.processedMicrophoneKey
         )
+        let appleVoiceProcessingAvailable = defaults.bool(
+            forKey: Self.experimentalAppleVoiceProcessingKey
+        )
+        self.appleVoiceProcessingAvailable = appleVoiceProcessingAvailable
+        let loadedMode: MicrophoneProcessingMode
         if
             let savedMode = defaults.string(
                 forKey: Self.microphoneProcessingModeKey
             ),
             let mode = MicrophoneProcessingMode(rawValue: savedMode)
         {
-            microphoneProcessingMode = mode
+            loadedMode = mode
         } else {
             let migratedMode: MicrophoneProcessingMode = defaults.bool(
                 forKey: Self.legacyAppleVoiceProcessingKey
             ) ? .apple : .off
-            microphoneProcessingMode = migratedMode
+            loadedMode = migratedMode
             defaults.set(
                 migratedMode.rawValue,
                 forKey: Self.microphoneProcessingModeKey
             )
         }
+        microphoneProcessingMode = loadedMode == .apple && !appleVoiceProcessingAvailable
+            ? .off
+            : loadedMode
         digitalGainDecibels = DigitalGain.clampedDecibels(
             Float(defaults.double(forKey: Self.digitalGainKey))
         )
@@ -759,9 +776,10 @@ final class AudioState: ObservableObject {
     /// the window: a window armed now neither delays nor interrupts it.
     ///
     /// The level gates close first, so no IO thread processes anything while
-    /// the process exits. The publisher engine stops, and the published
-    /// device is withdrawn, synchronously and in that order, as before. The
-    /// meters and the IOProc capture then stop and destroy what they hold on
+    /// the process exits, and the publisher renders silence. Apple voice
+    /// processing's engine, if one runs, stops, and the published device is
+    /// withdrawn, synchronously and in that order. The meters and the
+    /// processed microphone's IOProcs then stop and destroy what they hold on
     /// their own lifecycle queues, at `.userInteractive`, and Quit waits for
     /// them while some queue has finished a HAL call within
     /// `QuitPlan.lifecycleStopIdleTimeout`, and for at most
@@ -1131,7 +1149,7 @@ final class AudioState: ObservableObject {
         guard !quitRequested else {
             return
         }
-        guard microphoneProcessingMode != mode else {
+        guard microphoneProcessingMode != mode, availableProcessingModes.contains(mode) else {
             return
         }
 
@@ -2564,7 +2582,7 @@ final class AudioState: ObservableObject {
     }
 
     /// The output devices and the default output as the poll shows them, for
-    /// the publisher engine's output. An empty device list counts as unread:
+    /// the publisher's output. An empty device list counts as unread:
     /// it is what a failed list read leaves.
     private var publisherOutputSurvey: PublisherOutputSurvey {
         PublisherOutputSurvey(
@@ -2925,7 +2943,7 @@ final class AudioState: ObservableObject {
                 ? survey.defaultOutput
                 : survey.outputs?.first { $0.deviceID == outputDeviceID }
             HALLifecycleLog.record(
-                .processedMicrophonePublisherEngine,
+                .processedMicrophonePublisherIOProc,
                 .giveUp,
                 id: outputDeviceID,
                 transport: AudioDeviceTransportInfo.logDescription(polled?.info),

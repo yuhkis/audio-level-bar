@@ -22,8 +22,6 @@ extension AudioState {
         var now: () -> TimeInterval
         var scheduler: any AudioStateScheduler
         var microphoneAuthorization: any MicrophoneAuthorization
-        /// Makes the processed microphone's publisher engine.
-        var makePublisherEngine: () -> any ProcessedMicrophonePublisherEngine
         /// Makes the processed microphone's Apple voice-processing capture
         /// engine.
         var makeVoiceProcessingEngine: () -> any VoiceProcessingCaptureEngine
@@ -47,7 +45,6 @@ extension AudioState {
                 now: { ProcessInfo.processInfo.systemUptime },
                 scheduler: MainRunLoopScheduler(),
                 microphoneAuthorization: SystemMicrophoneAuthorization(),
-                makePublisherEngine: { AVAudioPublisherEngine() },
                 makeVoiceProcessingEngine: { AVAudioVoiceProcessingEngine() },
                 tapReclaimInventory: .live,
                 powerNotificationCenter: PowerStateLog.defaultCenter

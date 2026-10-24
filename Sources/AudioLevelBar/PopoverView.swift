@@ -298,14 +298,18 @@ struct PopoverView: View {
                     localized("Processing mode"),
                     selection: microphoneProcessingModeBinding
                 ) {
-                    ForEach(MicrophoneProcessingMode.allCases) { mode in
+                    ForEach(state.availableProcessingModes) { mode in
                         Text(mode.displayName).tag(mode)
                     }
                 }
                 .pickerStyle(.menu)
                 .disabled(state.processedMicrophoneState == .starting)
 
-                Text(localized("Apple provides echo cancellation and noise suppression (no AGC); WebRTC provides noise suppression only. When comparing them, turn off the consuming app’s own processing so it is not applied twice."))
+                Text(
+                    state.appleVoiceProcessingAvailable
+                        ? localized("Apple provides echo cancellation and noise suppression (no AGC); WebRTC provides noise suppression only. When comparing them, turn off the consuming app’s own processing so it is not applied twice.")
+                        : localized("WebRTC provides noise suppression only. Turn off the consuming app’s own noise suppression so it is not applied twice.")
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

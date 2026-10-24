@@ -1,7 +1,7 @@
 import Foundation
 
 /// How often, and for how long, the processed microphone tries again to start
-/// when the output its publisher engine is bound to reads no usable hardware
+/// when the output its publisher is bound to reads no usable hardware
 /// format.
 ///
 /// An output being reconfigured or removed reads 0 Hz or no channels, and

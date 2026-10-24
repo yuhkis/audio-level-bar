@@ -14,10 +14,11 @@ enum CoreAudioSystemError: LocalizedError {
     }
 }
 
-/// What an IOProc on a device's input receives.
-struct InputStreamFormat: Equatable {
+/// What an IOProc on a device's input receives, or what it hands the
+/// device's output.
+struct DeviceStreamFormat: Equatable {
     let sampleFormat: PCMSampleFormat
-    /// Channels summed over every input stream.
+    /// Channels summed over every stream of that direction.
     let channelCount: Int
     let sampleRate: Double
 }
@@ -59,7 +60,7 @@ final class CoreAudioSystem {
     }
 
     /// The devices `devices(for:)` lists, or nil when the device list itself
-    /// could not be read. The processed microphone's publisher engine chooses
+    /// could not be read. The processed microphone's publisher chooses
     /// its output from this, read uncached, by the same criteria the device
     /// pickers use.
     func listedDevices(for direction: AudioDirection) -> [AudioDevice]? {
@@ -354,12 +355,25 @@ final class CoreAudioSystem {
     /// An IOProc receives each stream in its virtual format. `channelCount`
     /// is the total over every input stream, which is how many samples per
     /// frame the level math sees across the buffer list.
-    func inputStreamFormat(for deviceID: AudioDeviceID) -> InputStreamFormat? {
+    func inputStreamFormat(for deviceID: AudioDeviceID) -> DeviceStreamFormat? {
+        streamFormat(for: deviceID, scope: kAudioDevicePropertyScopeInput)
+    }
+
+    /// The same for the device's output streams: the format an IOProc writes
+    /// each output stream in.
+    func outputStreamFormat(for deviceID: AudioDeviceID) -> DeviceStreamFormat? {
+        streamFormat(for: deviceID, scope: kAudioDevicePropertyScopeOutput)
+    }
+
+    private func streamFormat(
+        for deviceID: AudioDeviceID,
+        scope: AudioObjectPropertyScope
+    ) -> DeviceStreamFormat? {
         guard
             let streamIDs = objectIDList(
                 of: deviceID,
                 selector: kAudioDevicePropertyStreams,
-                scope: kAudioDevicePropertyScopeInput
+                scope: scope
             ),
             !streamIDs.isEmpty
         else {
@@ -405,7 +419,7 @@ final class CoreAudioSystem {
         guard let sampleFormat else {
             return nil
         }
-        return InputStreamFormat(
+        return DeviceStreamFormat(
             sampleFormat: sampleFormat,
             channelCount: channelCount,
             sampleRate: sampleRate

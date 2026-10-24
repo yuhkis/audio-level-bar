@@ -448,12 +448,9 @@ final class AudioStateWatchTests: XCTestCase {
         harness.settle()
         XCTAssertEqual(harness.holds.entered, [.hal(.start(microphone))])
 
-        // The publisher's configuration changes while the capture's
+        // The publisher's output reconfigures while the capture's
         // AudioDeviceStart is still in coreaudiod.
-        guard let publisher = harness.publisherEngines.engines.last else {
-            return XCTFail("no publisher engine was built")
-        }
-        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: publisher.notificationObject)
+        harness.hal.fireListener(deviceID: AudioStateHarness.speakers, selector: kAudioDevicePropertyNominalSampleRate)
         harness.settle()
         XCTAssertEqual(harness.holdReasons.last, "processing-invalidated")
 
