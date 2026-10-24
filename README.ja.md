@@ -10,7 +10,7 @@ macOSのメニューバーに、現在のスピーカー音量設定とマイク
 
 IssueやPull Requestは歓迎しますが、個人が余暇に開発しているため、対応や返信をお約束できません。要望に応えられないこと、応答までに時間がかかること、方針に合わない提案をお断りすることがあります。MIT Licenseのとおり無保証で提供しており、利用はご自身の責任でお願いします。音声入出力を扱う性質上、重要な収録や会議の前には、ご自身の環境で動作を確認してください。
 
-現時点では一般利用者向けの署名済み`.app`を配布していません。ソースから作るアプリは既定でアドホック署名、または自分で指定した証明書での署名です（[ビルドと実行](#ビルドと実行)参照）。Developer ID署名とnotarizationは未実施です。**加工済みマイクは実験的機能です。** それが具体的に何を意味するかは[加工済みマイク（実験的）](#加工済みマイク実験的)を参照してください。アプリ内で回避できない既知の制限と、Core Audioをマシン全体で止めうる操作上の注意が含まれます。それ以外の機能――メニューバーのメーター、デバイス選択、音量と入力ゲイン、ミュート、システム再生レベル監視――は実験的ではない通常の機能です。ただし、1つのデバイスに結び付けたHAL IOProcによる現在のマイクメーターと加工済みマイクの取り込みは、[ROADMAP.md](ROADMAP.md)の実機ゲートをまだ通っていません。機器の抜き差し、Bluetoothヘッドセット、スリープ復帰の確認は公開後に行い、最初のタグはその結果を待ちます。
+現時点では一般利用者向けの署名済み`.app`を配布していません。v0.4.0以降、後述の実機ゲートを通過した後に、Developer ID証明書で署名しAppleのnotarizationを受けたディスクイメージを各GitHub Releaseへ添付する予定です（[配布物からの導入](#配布物からの導入)参照）。まだ添付したReleaseはありません。ソースから作るアプリは既定でアドホック署名、または自分で指定した証明書での署名です（[ビルドと実行](#ビルドと実行)参照）。**加工済みマイクは実験的機能です。** それが具体的に何を意味するかは[加工済みマイク（実験的）](#加工済みマイク実験的)を参照してください。アプリ内で回避できない既知の制限と、Core Audioをマシン全体で止めうる操作上の注意が含まれます。それ以外の機能――メニューバーのメーター、デバイス選択、音量と入力ゲイン、ミュート、システム再生レベル監視――は実験的ではない通常の機能です。ただし、1つのデバイスに結び付けたHAL IOProcによる現在のマイクメーターと加工済みマイクの取り込みは、[ROADMAP.md](ROADMAP.md)の実機ゲートをまだ通っていません。機器の抜き差し、Bluetoothヘッドセット、スリープ復帰の確認は公開後に行い、最初のタグはその結果を待ちます。
 
 アプリの表示は英語と日本語に対応し、macOSの言語設定に従います。
 
@@ -95,6 +95,24 @@ osascript -e 'tell application id "io.github.yuhkis.audio-level-bar" to quit'
 - **macOS 26以降のSDK**。取り残されたProcess Tapの帰属判定に`CATapDescription.bundleIDs`を使うため、これより古いSDKではコンパイルできません。実行時は`#available`で分岐するため、できあがったアプリはmacOS 14.2でも動作します
 - Swift 6.1以降 / Xcode Command Line Tools
 
+## 配布物からの導入
+
+v0.4.0以降、[ROADMAP.md](ROADMAP.md)の実機ゲートを通過した後のGitHub Releaseには、Developer ID証明書で署名しAppleのnotarizationを受けた`Audio Level Bar-<version>.dmg`と、そのSHA-256を記した`Audio Level Bar-<version>.dmg.sha256`を添付します。まだ添付したReleaseはありません。それまでは次の節の手順でソースからビルドしてください。
+
+1. Releasesページから両方のファイルをダウンロードします。ターミナルで両方を置いたフォルダへ移動し、ダウンロードを確認します。`OK`と表示されます。
+
+   ```console
+   shasum -a 256 -c "Audio Level Bar-0.4.0.dmg.sha256"
+   ```
+
+2. ディスクイメージを開き、Audio Level Barを隣のApplicationsフォルダへドラッグしてから、ディスクイメージを取り出します。以前のコピーが動作中なら、先にアプリ自身の終了項目で終了してください。加工済みマイクの公開中は強制終了しないでください。
+3. アプリケーションフォルダからAudio Level Barを開きます。インターネットからダウンロードしたアプリを開くかどうかを、macOSが一度だけ確認します。代わりに、アプリを検証できない、またはアプリが壊れていると表示された場合は回避しないでください。公開したものとは別のファイルなので、もう一度ダウンロードしてください。
+4. 初回起動時にmacOSのマイク許可ダイアログが表示されます。拒否してもスピーカー音量とデバイス選択は使え、マイクレベルは`--`になります。システムオーディオ録音の許可は、設定でシステム再生レベル監視または加工済みマイクを初めて有効にしたときに要求されます。配布物はバージョンをまたいで同じ署名の同一性を保つため、許可した権限は更新後も残ります。
+
+ログイン時に起動するには、システム設定の「一般」→「ログイン項目と機能拡張」で「ログイン時に開く」へ追加します。[インストールと常用](#インストールと常用)で説明する`make install-login-agent`は、ソースからビルドする場合の手順です。同じバージョンとbuildのこのリポジトリのcloneを必要とし、インストール済みのアプリをそのソースと照合してからLaunchAgentを設置します。どちらか一方だけを使ってください。
+
+自動更新はなく、アプリが更新を確認することもありません。アプリは実行中に外部サービスへ接続しないためです。更新するときはアプリを終了し、新しいディスクイメージのアプリを、アプリケーションフォルダにあるコピーの上へドラッグします。配布物と`make install`で入れたビルドはどちらも`/Applications/Audio Level Bar.app`に置かれるため、一度に入れておけるのはどちらか一方です。`make install`は、同じバージョンとbuildで内容の異なるコピーの置き換えを拒否します。削除するときはアプリを終了してゴミ箱へ移します。設定はdefaultsドメイン`io.github.yuhkis.audio-level-bar`に残り、`defaults delete io.github.yuhkis.audio-level-bar`で消せます。
+
 ## ビルドと実行
 
 fishを含む任意のシェルから、プロジェクト直下で実行できます。
@@ -106,6 +124,7 @@ make app
 make verify-app
 make install
 make install-login-agent
+make release
 make check-localization
 make ci
 make run
@@ -121,7 +140,13 @@ make run
 env CODESIGN_IDENTITY='<name of your certificate>' make app
 ```
 
-アドホック署名のままだと、macOSから見て再ビルドのたびに別のアプリになります。designated requirementがバイナリのハッシュ（`codesign -d -r- "dist/Audio Level Bar.app"`で`cdhash H"…"`と表示されます）なので、ビルドし直すたびにマイクとシステムオーディオ録音を許可し直すことになります。証明書で署名すると条件が`identifier "io.github.yuhkis.audio-level-bar" and certificate leaf = H"…"`になり、再ビルドしても同じアプリとして扱われます。配布しないのであればApple Developer Programは不要で、自己署名のコード署名証明書で足ります。キーチェーンアクセスで「証明書アシスタント」→「証明書を作成…」を開き、名前を決め（例 `audio-level-bar-local`）、Identity Typeを「自己署名ルート」、証明書のタイプを「コード署名」にし、「デフォルトを無効化」にチェックして有効期間を長めにします（既定は365日。切れると作り直しになり、再許可が1回発生します）。そのうえで`env CODESIGN_IDENTITY=audio-level-bar-local make app`を実行します。この証明書は`security find-identity -v -p codesigning`では`CSSMERR_TP_NOT_TRUSTED`として有効一覧から外れますが、信頼設定を変えなくても`codesign`による署名と検証に支障はありません。証明書署名にはhardened runtimeとsecure timestamp（ネットワーク接続が必要）を付け、`Resources/AudioLevelBar.entitlements`の`com.apple.security.device.audio-input` entitlementを埋め込みます。hardened runtimeはこのentitlementのないプロセスにマイク入力を渡さないためです。アドホックと証明書を切り替えた回は再許可が1回発生します。それ以降、証明書署名のビルドでは再ビルドしても許可が残りますが、アドホック署名では再ビルドのたびに再許可が必要です。証明書署名のビルドは実機で起動し、hardened runtimeとentitlementの下でマイクメーターとシステム再生レベル監視が動作することを確認しています。この確認は、1つのデバイスに結び付けたHAL IOProcによる現在のマイクメーターと加工済みマイクの取り込みより前のもので、これらはまだ実機で動かしていません。機器の抜き差しと加工済みマイクは、これまでアドホック署名のビルドでしか試していません。スリープ復帰はまだどのビルドでも確認しておらず、機器の抜き差しとスリープ復帰を対象とする[ROADMAP.md](ROADMAP.md)の実機ゲートは未通過です。他人へ渡せる`.app`にはDeveloper ID署名とnotarizationが必要で、このプロジェクトでは未実施です。
+アドホック署名のままだと、macOSから見て再ビルドのたびに別のアプリになります。designated requirementがバイナリのハッシュ（`codesign -d -r- "dist/Audio Level Bar.app"`で`cdhash H"…"`と表示されます）なので、ビルドし直すたびにマイクとシステムオーディオ録音を許可し直すことになります。証明書で署名すると条件が`identifier "io.github.yuhkis.audio-level-bar" and certificate leaf = H"…"`になり、再ビルドしても同じアプリとして扱われます。配布しないのであればApple Developer Programは不要で、自己署名のコード署名証明書で足ります。キーチェーンアクセスで「証明書アシスタント」→「証明書を作成…」を開き、名前を決め（例 `audio-level-bar-local`）、Identity Typeを「自己署名ルート」、証明書のタイプを「コード署名」にし、「デフォルトを無効化」にチェックして有効期間を長めにします（既定は365日。切れると作り直しになり、再許可が1回発生します）。そのうえで`env CODESIGN_IDENTITY=audio-level-bar-local make app`を実行します。この証明書は`security find-identity -v -p codesigning`では`CSSMERR_TP_NOT_TRUSTED`として有効一覧から外れますが、信頼設定を変えなくても`codesign`による署名と検証に支障はありません。証明書署名にはhardened runtimeとsecure timestamp（ネットワーク接続が必要）を付け、`Resources/AudioLevelBar.entitlements`の`com.apple.security.device.audio-input` entitlementを埋め込みます。hardened runtimeはこのentitlementのないプロセスにマイク入力を渡さないためです。アドホックと証明書を切り替えた回は再許可が1回発生します。それ以降、証明書署名のビルドでは再ビルドしても許可が残りますが、アドホック署名では再ビルドのたびに再許可が必要です。証明書署名のビルドは実機で起動し、hardened runtimeとentitlementの下でマイクメーターとシステム再生レベル監視が動作することを確認しています。この確認は、1つのデバイスに結び付けたHAL IOProcによる現在のマイクメーターと加工済みマイクの取り込みより前のもので、これらはまだ実機で動かしていません。機器の抜き差しと加工済みマイクは、これまでアドホック署名のビルドでしか試していません。スリープ復帰はまだどのビルドでも確認しておらず、機器の抜き差しとスリープ復帰を対象とする[ROADMAP.md](ROADMAP.md)の実機ゲートは未通過です。他人へ渡せる`.app`にはDeveloper ID署名とnotarizationが必要で、`make release`がこれを行います（後述）。
+
+`make release`は他の人へ渡す配布物を作ります。アプリとApplicationsへのリンクを収めた`Audio Level Bar-<version>.dmg`と、そのSHA-256を`dist/release/`に置きます。`make release RELEASE_FLAGS=--zip`はディスクイメージの代わりにZIPアーカイブを、`RELEASE_FLAGS='--dmg --zip'`は両方を作ります。未commitの変更があるworking treeでは実行を拒否します。アプリは`make app`とは別に、コンパイラの出力からビルドディレクトリを除き、実行ファイルからデバッグシンボルを取り除いてビルドします。そのうえで、実行ファイルにビルドディレクトリやホームディレクトリの名前が残っている場合と、[`scripts/scan-private-content.sh`](scripts/scan-private-content.sh)がバンドルのファイル名やファイルに何かを見つけた場合は、パッケージを作りません。この検査には[開発](#開発)で説明するローカルのパターン一覧も必要です。`CODESIGN_IDENTITY`は`make app`と同じく証明書を指定します。配布にはDeveloper ID Application証明書が必要で、これはApple Developer Programへの加入で得られます。`NOTARY_PROFILE`は`xcrun notarytool store-credentials`で作ったキーチェーンのプロファイル名です。これを設定すると、アプリとディスクイメージをAppleのnotarizationサービスへ提出し、ticketをstapleし、Gatekeeperの評価を確かめます。どちらも無ければアドホック署名でnotarizationもせず、配布できない旨を表示します。全手順の予行にはこれで足ります。キーチェーンから証明書を選ぶことはなく、`NOTARY_PROFILE`を設定しない限りどこへも送信しません。検査項目の一覧は[開発リファレンス](docs/development.md#release-builds)にあります。
+
+```console
+env CODESIGN_IDENTITY='<name of your Developer ID Application certificate>' NOTARY_PROFILE='<profile name>' make release
+```
 
 初回起動時にmacOSのマイク許可ダイアログが表示されます。システムオーディオ録音の許可は、設定でシステム再生レベル監視または加工済みマイクを初めて有効にしたときに要求されます。アドホック署名は再ビルド間でもMac間でも恒久的なコード同一性を与えないため、権限状態は各Macで確認してください。自分の証明書で署名すると、同じMacでの再ビルド間では同一性が保たれます（前述）。
 
@@ -137,7 +162,7 @@ env CODESIGN_IDENTITY='<name of your certificate>' make app
 
 公開準備の完了条件と配布方針は[ROADMAP.md](ROADMAP.md)に記録しています。
 
-通常のアプリビルドには、固定版のWebRTC APMとAbseilをまとめたarm64 XCFrameworkを`Vendor/`へ含めています。そのためリポジトリ自体にビルド用の静的バイナリが含まれます。Release assetとして`.app`を配布しないのはこれとは別の理由で、他人へ渡せる`.app`にはDeveloper ID署名とnotarizationが必要であり、このプロジェクトでは未実施だからです。バイナリ自身と固定ソースのSHA-256、再生成手順は`ThirdParty/WebRTCNoiseSuppression/README.md`、ライセンスとPATENTSは[THIRD_PARTY_NOTICES.ja.md](THIRD_PARTY_NOTICES.ja.md)から追跡できます。アプリの実行中にWebRTCや外部サービスへ接続することはありません。
+通常のアプリビルドには、固定版のWebRTC APMとAbseilをまとめたarm64 XCFrameworkを`Vendor/`へ含めています。そのためリポジトリ自体にビルド用の静的バイナリが含まれます。これとは別に、`.app`そのものは、v0.4.0以降に[配布物からの導入](#配布物からの導入)で説明する、Developer ID署名とnotarizationを済ませたディスクイメージとしてだけ配布します。バイナリ自身と固定ソースのSHA-256、再生成手順は`ThirdParty/WebRTCNoiseSuppression/README.md`、ライセンスとPATENTSは[THIRD_PARTY_NOTICES.ja.md](THIRD_PARTY_NOTICES.ja.md)から追跡できます。アプリの実行中にWebRTCや外部サービスへ接続することはありません。
 
 ## 権限とプライバシー
 

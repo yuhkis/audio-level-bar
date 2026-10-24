@@ -21,7 +21,7 @@ These product and safety boundaries hold for every change. Read a task reference
 | --- | --- |
 | Change behavior or architecture | The relevant sections of [README.md](README.md) and [DESIGN.md](DESIGN.md); keep the English and Japanese READMEs consistent |
 | Change Core Audio or verify devices | [Audio verification](docs/development.md#audio-verification); record the baseline before changing device or volume state, and restore it afterward. A hardware gate follows the [hardware gate procedure](docs/development.md#hardware-gate-procedure) |
-| Build a candidate, sign, or install | [Build and installation](docs/development.md#build-and-installation); commit before building, and verify the bundle itself |
+| Build a candidate or a release, sign, notarize, or install | [Build and installation](docs/development.md#build-and-installation) and [Release builds](docs/development.md#release-builds); commit before building, and verify the bundle itself |
 | Change user-facing strings | [Localization](docs/development.md#localization) |
 | Change vendored code, dependencies, or publication policy | [CONTRIBUTING.md](CONTRIBUTING.md), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and the relevant section of [ROADMAP.md](ROADMAP.md) |
 

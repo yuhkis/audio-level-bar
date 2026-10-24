@@ -6,15 +6,35 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(dirname "$SCRIPT_DIR")
 SCRATCH_DIR=${AUDIO_LEVEL_BAR_BUILD_DIR:-"$PROJECT_DIR/.build"}
 DIST_DIR="$PROJECT_DIR/dist"
-APP_BUNDLE="$DIST_DIR/Audio Level Bar.app"
+# scripts/release-app.sh builds its bundle under dist/release/ instead of the
+# development candidate's place, so that neither replaces the other.
+APP_BUNDLE=${AUDIO_LEVEL_BAR_APP_BUNDLE:-"$DIST_DIR/Audio Level Bar.app"}
 INFO_PLIST="$PROJECT_DIR/Resources/Info.plist"
 ENTITLEMENTS="$PROJECT_DIR/Resources/AudioLevelBar.entitlements"
 VERIFY_SCRIPT="$SCRIPT_DIR/verify-app.sh"
 
 case "$APP_BUNDLE" in
-    "$PROJECT_DIR"/dist/*) ;;
+    */../* | */..)
+        echo "Refusing an app bundle path that walks out of its directory." >&2
+        exit 1
+        ;;
+    "$DIST_DIR/Audio Level Bar.app" | "$DIST_DIR"/*"/Audio Level Bar.app") ;;
     *)
-        echo "Refusing to replace an app bundle outside this project's dist directory." >&2
+        echo "Refusing to replace an app bundle outside this project's dist directory, or under another name." >&2
+        exit 1
+        ;;
+esac
+
+# A distribution build (scripts/release-app.sh) must not carry the directory
+# it was built in. The compilers are told to write the project directory as
+# "." into debug info and #filePath literals, and the executable is stripped
+# before it is signed: the linker names every object file by its absolute path
+# in the debug symbol table, and no compiler flag reaches those entries.
+case "${AUDIO_LEVEL_BAR_DISTRIBUTION:-false}" in
+    1 | true | yes) DISTRIBUTION=true ;;
+    0 | false | no) DISTRIBUTION=false ;;
+    *)
+        echo "AUDIO_LEVEL_BAR_DISTRIBUTION must be true or false." >&2
         exit 1
         ;;
 esac
@@ -116,6 +136,24 @@ source_state() {
     fi
 }
 
+# What the stripped distribution executable must not carry: debug symbol
+# entries (the SO and OSO stabs that name source files and object files), and
+# the build directories themselves, in whatever form the compilers saw them.
+check_distribution_executable() {
+    executable=$1
+    stabs=$(nm -ap "$executable" | awk '$2 == "-" && ($5 == "SO" || $5 == "OSO")' | wc -l | tr -d ' ')
+    if [ "$stabs" -ne 0 ]; then
+        echo "The distribution executable still carries $stabs debug symbol entries." >&2
+        return 1
+    fi
+    for directory in "$PROJECT_DIR" "$PROJECT_DIR_PHYSICAL" "$SCRATCH_DIR"; do
+        if LC_ALL=C grep -a -q -F -- "$directory" "$executable"; then
+            echo "The distribution executable names the directory it was built in." >&2
+            return 1
+        fi
+    done
+}
+
 if [ "$HAS_GIT_METADATA" = true ]; then
     GIT_COMMIT=$(git -C "$PROJECT_DIR" rev-parse HEAD)
     COMMIT_EPOCH=$(git -C "$PROJECT_DIR" show -s --format=%ct HEAD)
@@ -155,20 +193,45 @@ if [ -d "$APP_BUNDLE" ]; then
             echo "The retained candidate for this build number does not match the request (for example its signature); remove it from dist/ and build again, or bump CFBundleVersion when a new candidate is actually being prepared." >&2
             exit 1
         fi
+        if [ "$DISTRIBUTION" = true ] &&
+            ! check_distribution_executable "$APP_BUNDLE/Contents/MacOS/AudioLevelBar"; then
+            echo "The retained candidate for this build number was not built for distribution; remove it and build again." >&2
+            exit 1
+        fi
         echo "$APP_BUNDLE"
         exit 0
     fi
 fi
 
+# Compiler flags for a distribution build. Both the path as given and the
+# physical path are mapped, since either may be the one the compiler records,
+# and a scratch directory outside the project is mapped on its own. swiftc
+# takes the mapping as a separate argument (`-file-prefix-map <old=new>`, which
+# also covers -debug-prefix-map and -coverage-prefix-map); clang takes it
+# attached.
+set --
+if [ "$DISTRIBUTION" = true ]; then
+    for prefix in "$PROJECT_DIR" "$PROJECT_DIR_PHYSICAL"; do
+        set -- "$@" -Xswiftc -file-prefix-map -Xswiftc "$prefix=." -Xcc "-ffile-prefix-map=$prefix=."
+        [ "$PROJECT_DIR_PHYSICAL" != "$PROJECT_DIR" ] || break
+    done
+    case "$SCRATCH_DIR" in
+        "$PROJECT_DIR"/* | "$PROJECT_DIR_PHYSICAL"/*) ;;
+        *) set -- "$@" -Xswiftc -file-prefix-map -Xswiftc "$SCRATCH_DIR=.build" -Xcc "-ffile-prefix-map=$SCRATCH_DIR=.build" ;;
+    esac
+fi
+
 swift build \
     --package-path "$PROJECT_DIR" \
     --scratch-path "$SCRATCH_DIR" \
-    -c release
+    -c release \
+    "$@"
 
 BIN_DIR=$(swift build \
     --package-path "$PROJECT_DIR" \
     --scratch-path "$SCRATCH_DIR" \
     -c release \
+    "$@" \
     --show-bin-path)
 
 if [ "$HAS_GIT_METADATA" = true ]; then
@@ -195,6 +258,16 @@ LICENSES_DIR="$CONTENTS_DIR/Resources/ThirdPartyLicenses/WebRTCNoiseSuppression"
 
 mkdir -p "$MACOS_DIR"
 cp "$BIN_DIR/AudioLevelBar" "$MACOS_DIR/AudioLevelBar"
+if [ "$DISTRIBUTION" = true ]; then
+    # The linker's ad-hoc signature would only be invalidated by strip; the
+    # real signature is applied below. -S drops the debug symbol entries,
+    # which name every source and object file by its absolute path, and -x
+    # the local symbols. The global symbols stay, so that a crash report from
+    # someone else's Mac still names the functions without a dSYM.
+    codesign --remove-signature "$MACOS_DIR/AudioLevelBar"
+    strip -S -x "$MACOS_DIR/AudioLevelBar"
+    check_distribution_executable "$MACOS_DIR/AudioLevelBar"
+fi
 cp "$INFO_PLIST" "$CONTENTS_DIR/Info.plist"
 mkdir -p "$CONTENTS_DIR/Resources"
 cp "$PROJECT_DIR/LICENSE" "$CONTENTS_DIR/Resources/LICENSE"
@@ -242,6 +315,7 @@ fi
 "$VERIFY_SCRIPT" "$STAGED_APP"
 
 PREVIOUS_APP="$STAGING_ROOT/previous.app"
+mkdir -p "$(dirname "$APP_BUNDLE")"
 if [ -d "$APP_BUNDLE" ]; then
     DIST_HAD_PREVIOUS=true
 fi

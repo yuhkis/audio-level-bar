@@ -9,9 +9,9 @@
 - 権利確認、公開文書、CI、公開前監査が完了するまでGitHubリポジトリをprivateのまま維持します。実機ゲートは公開後の最初の作業として行い、その結果を記録してから`v0.4.0`タグを作成します（「publicへ変更するゲート」の節）
 - 本体コードはルート`LICENSE`のMIT Licenseで提供します。適用範囲は出自で決まります。`ThirdParty/`に置いた上流のライセンス本文と、`Vendor/`の静的ライブラリへコンパイルした上流のコードはMITの対象外で、各上流ライセンスが優先します。同じ場所に置いた自作のC ABIラッパはMITで、区別はSPDXヘッダで示します
 - `make app`は本体`LICENSE`をアプリバンドルの`Contents/Resources/LICENSE`へ同梱し、`make verify-app`がソースとの一致を検証します
-- 最初の公開版は`v0.4.0`とし、`.app`のRelease assetは添付しません
+- 最初の公開版は`v0.4.0`とし、実機ゲートの通過後に、Developer ID署名とnotarizationを済ませたDMGをRelease assetとして添付します
 - リポジトリにはarm64用のWebRTC／Abseil静的XCFrameworkを含めます。固定ソース、hash、再生成手順、第三者noticeを追跡可能にします
-- 一般配布バイナリは、Developer ID署名、Hardened Runtime、notarization、更新手順を検証した後の別マイルストーンとします
+- 一般配布バイナリは、`make release`で作るDeveloper ID署名、Hardened Runtime、notarization済みのDMGとし、v0.4.0以降のGitHub Releaseのassetとして配布します。添付は実機ゲートの通過後です。Developer ID Application証明書とnotarytoolの資格情報は保守者が用意し、リポジトリには置きません。更新は手動で、利用者が新しいDMGから置き換えます
 - 日常利用する正規版は`/Applications/Audio Level Bar.app`とし、`dist/Audio Level Bar.app`はビルド・検証用候補として扱います
 - ログイン時起動は正規の`/Applications`版を対象にします。正式署名後は`SMAppService`への移行を検討します
 - 複数のMacへ導入するときは、Macごとに再ビルドせず、最初に検証した同一バンドルを転送します。同じソースから別々に生成した候補は、同じMacで作り直した場合でも、source fingerprintが一致する一方でbundle content fingerprintとCDHashが一致せず、同一バイトの`.app`にはならないためです
@@ -229,19 +229,20 @@ CIでは`make diagnose`、GUI、TCC、デバイス切替、音量書き込み、
 - Repository: `audio-level-bar`
 - License: MIT
 - First public tag: `v0.4.0`（実機ゲート通過後に作成）
-- Release assets: なし
-- Binary distribution: Developer ID署名・notarization完了後に別途判断
+- Release assets: Developer ID署名＋notarizeしたDMG（`Audio Level Bar-<version>.dmg`）とそのSHA-256（v0.4.0以降、実機ゲート通過後）
+- Binary distribution: Developer ID署名＋notarizeしたDMGをGitHub Releaseのassetとして配布する（v0.4.0以降、実機ゲート通過後）。`make release`で作り、検査項目は[docs/development.md](docs/development.md#release-builds)に従う
 - Update mechanism: 当初は手動。ネットワークアクセスを伴う自動更新は別の設計変更として扱う
 - Private vulnerability reporting: public化の直後に有効化する。`SECURITY.md`／`SECURITY.ja.md`が指定する報告経路がこれで、有効化するまで報告先が存在しない
 
 ## 公開後の作業
 
-- 実機ゲート（機器の抜き差し、Bluetoothヘッドセット、スリープ復帰）を[docs/development.md](docs/development.md#hardware-gate-procedure)の手順と「次のゲートのログ合否基準」で実施し、結果を記録する。通過した候補に`v0.4.0`タグを作成する。不合格なら修正し、修正したbuildで再実施する
+- 実機ゲート（機器の抜き差し、Bluetoothヘッドセット、スリープ復帰）を[docs/development.md](docs/development.md#hardware-gate-procedure)の手順と「次のゲートのログ合否基準」で実施し、結果を記録する。通過した候補に`v0.4.0`タグを作成し、`make release`で作ったDMGとSHA-256をReleaseへ添付する。ゲートを通過したcommitが`make release`より前のものなら、アプリのソースに差分がないことを[docs/development.md](docs/development.md#release-builds)の手順で確かめた後のcommitから配布物を作る。不合格なら修正し、修正したbuildで再実施する
 - `PublicProcessedMicrophoneDevice`を専用の直列ライフサイクルキューへ移し、セッションIDで古い結果を捨てる形にする。使用中リスナーは無効化だけの通知にして値をHALワーカーで読み、`AudioState`の`refreshDevices()`と`deviceUID`もワーカーへ移す。起動時の`refreshControls()`と孤立Process Tapの回収も、他の資源を作る前という順序を保ってワーカーへ移す。現在はこれらがメインスレッドで同期的にHALを呼ぶため、応答しないcoreaudiodがUIを止め、利用者を強制終了へ向かわせ得る（[DESIGN.md](DESIGN.md#メインスレッドに残る同期的なhal処理)）
 - 加工済みマイクのpublisherとApple音声処理の`AVAudioEngine`の準備、開始、停止を、Apple音声処理の開始の直前と直後にキャッシュを使わずに行う既定デバイスのIDの読み取りも含めて、メインスレッドから専用の直列キューへ移す。エンジンの生成から破棄までを1つのキューに閉じ、「publicへ変更するゲート」の節に記録した`-[AVAudioEngine dealloc]`とAVFAudioのリスナーの競合を再び招かないことを確かめる。現在は、終了時に止めたエンジンをプロセスの終了まで、それ以外で止めたエンジンを開始を認める次の評価まで解放しないことでこの競合を避けており、キューへ移してもこの規則を保つ。終了時のpublisherの停止と公開デバイスの破棄も、上限付きの停止待ちに含める。現在は応答しないcoreaudiodで、これらの呼び出しがUIと終了を止め得る。終了の指示から終了までの最悪の時間にも、終了の遅延と停止待ちの間にある、上限のないこれらの手順が含まれる（[DESIGN.md](DESIGN.md#メインスレッドに残る同期的なhal処理)）
 - Apple音声処理のエンジンは開始時の入力と出力へ結び付けているが、動作中にBluetooth機器が接続され、エンジンを止める静穏期間の解除より前にmacOSがその機器を既定にした場合に、結び付けたエンジンもその機器へ移るかは、実機ゲート（③b-Appleの最初のヘッドセットのサイクル、基準1）で判定する。ゲートの判断でApple方式を残余つきで残す場合は、その残余を取り除く設計を検討する。定期更新を契機にその場で止める方法は、構成変更の最中にIOを止めることになるため避ける
 - 既定出力が集約デバイスのとき、システム再生レベル監視のTapと非公開の集約デバイスを作るかの判断にも、その全サブデバイスの構成を使うかを決める。現在はマイク側の判断だけが、有効でないメンバーと解決できないメンバーを含めて判定する
 - 自動のやり直しをやめた後の状態を見直す。加工済みマイクが出力のやり直しをやめた後も、開始していない取り込みのIOProcが残ってマイクメーターが受け渡されたままになる点と、処理方式を変えてもやり直しの回数が戻らない点である。やり直しの上限と間隔、およびHALが値の変わらない既定デバイスの通知を送る場合の抑制は、実機ゲートの結果に応じて見直す
+- ログイン時起動を`SMAppService`によるログイン項目へ移す。現在、配布物から導入した利用者はシステム設定のログイン項目へ手動で追加し、`make install-login-agent`は同じバージョンとbuildのcloneを前提とする（[README.ja.md](README.ja.md#配布物からの導入)）
 - 静穏期間中の終了で、終了の指示の時点で世代番号を進め、指示の直前に発行した停止を遅延中に走らせずに後始末へ任せるかを決める
 - アプリターゲットの配線のうち、他の防御に隠れて、それだけを戻しても失敗するテストがないもの（評価の手順ごとの停止だけの許可の結び付け、終了時にレベルのゲートを先に閉じる順序、ピッカーの書き込みの完了時の再保留、いくつかの見張りの条件、公開の中断が3回続いた後に公開の手順が4回目を発行しないことなど）を、偽物のHALで観測できるようにして固定する
 - Apple音声処理の有効化（`setVoiceProcessingEnabled`）と、準備だけ済んで開始していないエンジンの停止にも前後の行を付け、フレームワークの中で起きるIOProcの作成と破棄を、ゲートがアプリの行に対応付けられるようにする
