@@ -16,7 +16,7 @@ public struct SourceRefusalLatch: Equatable {
         /// Apple voice processing refused the default input or output it was
         /// about to open. Stands only while that mode is selected.
         case voiceProcessing
-        /// The read made before the publisher engine is built found no
+        /// The read made before the publisher is built found no
         /// output it may be bound to. Stands whatever the mode and the input,
         /// while the poll shows the same default output and transport.
         case publisherOutput
@@ -80,7 +80,7 @@ public struct SourceRefusalLatch: Equatable {
         )
     }
 
-    /// The uncached read made before the publisher engine is built found no
+    /// The uncached read made before the publisher is built found no
     /// output it may be bound to, while the poll still showed one.
     /// - Parameters:
     ///   - outputDeviceID: The default output as the poll shows it.

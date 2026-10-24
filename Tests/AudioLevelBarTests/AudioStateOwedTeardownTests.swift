@@ -57,10 +57,6 @@ final class AudioStateOwedTeardownTests: XCTestCase {
         line.flatMap { AudioStateHarness.field("gen", of: $0) }
     }
 
-    private func lastOperation(of publisher: FakePublisherEngine) -> FakePublisherEngine.Call? {
-        publisher.calls.last { $0 != .readBoundOutput }
-    }
-
     /// The calls on the published tap and aggregate device, and on an
     /// earlier run's, made after the first `count` calls.
     private func destroys(_ harness: AudioStateHarness, after count: Int) -> [FakeHALLifecycleCalls.Call] {
@@ -210,36 +206,36 @@ final class AudioStateOwedTeardownTests: XCTestCase {
         XCTAssertEqual(harness.lifecycleCalls(after: settled), [], "and the teardown is settled")
     }
 
-    func testAWindowThatArmsWhileTheEnginesStopHoldsThePublicationsDestroysBack() {
+    func testAWindowThatArmsInsideTheWithdrawalHoldsItsTapAndTheQueuedReleasesBack() {
         let harness = AudioStateHarness(processedMicrophone: true)
         defer { harness.tearDown() }
         harness.launchAndPublish()
         harness.setPublishedDeviceInUse(true)
         harness.settle()
         XCTAssertEqual(harness.state.processedMicrophoneState, .active)
-        guard let publisher = harness.publisherEngines.engines.last else {
-            return XCTFail("no publisher was built")
-        }
-        // The listener fires while the publisher's stop is on its way.
-        var fired = false
-        publisher.onCall = { [unowned harness] call in
-            guard call == .stop, !fired else {
-                return
-            }
-            fired = true
-            harness.fireSystemNotification(.defaultInput)
-        }
         // The consuming app lets go, and the feature is switched off while
         // the engines still run out their grace period: no window holds, so
         // the teardown is issued at once.
         harness.setPublishedDeviceInUse(false)
         harness.settle()
         let before = harness.hal.calls.count
+        // The listener fires inside the withdrawal's first destroy, made on
+        // the main thread right after the engines' stop.
+        var fired = false
+        var gateOpen: Bool?
+        let engine = harness.state.processedMicrophoneEngineForTesting
+        let aggregate = aggregate
+        harness.holds.onEnter = { [unowned harness] point in
+            guard point == .hal(.destroyAggregate(aggregate)), !fired else {
+                return
+            }
+            fired = true
+            gateOpen = engine.livePublisherContextForTesting?.close() ?? false
+            harness.fireSystemNotification(.defaultInput)
+        }
 
-        // Keep capture teardown queued until the publisher's stop has fired
-        // the notification. Otherwise its generation check and begin line
-        // can straddle that notification on a different queue, so this
-        // publication-teardown test depends on thread scheduling.
+        // Keep the IOProcs' release queued until the withdrawal has fired
+        // the notification, so its generation check comes after it.
         let captureMayStop = DispatchSemaphore(value: 0)
         harness.state.lifecycleQueuesForTesting.processedMicrophoneCapture.async {
             captureMayStop.wait()
@@ -248,23 +244,28 @@ final class AudioStateOwedTeardownTests: XCTestCase {
         captureMayStop.signal()
         harness.settle()
 
-        XCTAssertTrue(fired, "the notification ran inside the publisher's stop")
+        XCTAssertTrue(fired, "the notification ran inside the withdrawal")
+        XCTAssertEqual(gateOpen, false, "the publisher was already silent")
         XCTAssertEqual(
             harness.lines(withPrefix: "processed-microphone-capture-ioproc interrupt-stop ").count,
             1,
-            "the queued capture release is held by the same notification"
+            "the queued release is held by the same notification"
         )
-        XCTAssertEqual(lastOperation(of: publisher), .stop, "the stop was issued before the change began")
         XCTAssertEqual(
             destroys(harness, after: before),
-            [],
-            "the destroys that follow it are not made inside the window that armed meanwhile"
+            [.destroyAggregate(aggregate)],
+            "the tap's destroy is not made inside the window that armed meanwhile"
         )
-        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-aggregate interrupt-stop ").count, 1)
+        XCTAssertEqual(harness.lines(withPrefix: "processed-microphone-tap interrupt-stop ").count, 1)
+        XCTAssertFalse(
+            harness.hal.lifecycleCalls.contains(.stop(AudioStateHarness.speakers)),
+            "nor is the silent publisher stopped inside it"
+        )
 
         passWindow(harness)
 
         XCTAssertEqual(destroys(harness, after: before), [.destroyAggregate(aggregate), .destroyProcessTap(tap)])
+        XCTAssertEqual(harness.lastPublisherCall, .destroyIOProc(AudioStateHarness.speakers))
         XCTAssertEqual(beginLinesInsideAWindow(harness), [])
         XCTAssertEqual(harness.state.processedMicrophoneState, .disabled)
     }

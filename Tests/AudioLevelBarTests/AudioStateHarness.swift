@@ -37,7 +37,6 @@ final class AudioStateHarness {
     let authorization = FakeMicrophoneAuthorization()
     let lines = HALLineLog()
     let holds = CallHolds()
-    let publisherEngines = PublisherEngineLog()
     let voiceProcessingEngines = VoiceProcessingEngineLog()
     /// Where a test posts the system's sleep and wake.
     let powerNotifications = NotificationCenter()
@@ -50,13 +49,15 @@ final class AudioStateHarness {
     init(
         systemOutputMonitoring: Bool = false,
         processedMicrophone: Bool = false,
-        processingMode: MicrophoneProcessingMode = .off
+        processingMode: MicrophoneProcessingMode = .off,
+        appleVoiceProcessingAvailable: Bool = true
     ) {
         scheduler = ManualScheduler(clock: clock)
         defaults = UserDefaults(suiteName: suiteName)!
         defaults.set(systemOutputMonitoring, forKey: "systemOutputMonitoringEnabled")
         defaults.set(processedMicrophone, forKey: "processedMicrophoneEnabled")
         defaults.set(processingMode.rawValue, forKey: "microphoneProcessingMode")
+        defaults.set(appleVoiceProcessingAvailable, forKey: AudioState.experimentalAppleVoiceProcessingKey)
 
         hal.listedOutputDevices = [FakeAudioSystem.speakersDevice, FakeAudioSystem.usbOutputDevice]
         // The uncached reads Apple voice processing makes see the same
@@ -93,7 +94,6 @@ final class AudioStateHarness {
         }
 
         let clock = clock
-        let publisherEngines = publisherEngines
         let voiceProcessingEngines = voiceProcessingEngines
         state = AudioState(
             defaults: defaults,
@@ -103,7 +103,6 @@ final class AudioStateHarness {
                 now: { clock.now },
                 scheduler: scheduler,
                 microphoneAuthorization: authorization,
-                makePublisherEngine: { publisherEngines.make() },
                 makeVoiceProcessingEngine: { voiceProcessingEngines.make() },
                 tapReclaimInventory: OrphanedProcessTapReclaimer.Inventory(
                     otherRunningInstances: { [] },
@@ -163,7 +162,8 @@ final class AudioStateHarness {
     func holdCaptureStart() {
         let captureQueue = state.lifecycleQueuesForTesting.processedMicrophoneCapture.label
         holds.hold { point, queueLabel in
-            guard case .hal(.start) = point else {
+            // The publisher's start runs on the same queue, before it.
+            guard case let .hal(.start(deviceID)) = point, !Self.publisherOutputs.contains(deviceID) else {
                 return false
             }
             return queueLabel == captureQueue
@@ -278,12 +278,36 @@ final class AudioStateHarness {
         }
     }
 
+    /// The output devices the processed microphone's publisher may be bound
+    /// to here.
+    static let publisherOutputs: Set<AudioDeviceID> = [speakers, usbOutput]
+
+    /// The publisher IOProcs created so far, one per publisher start that got
+    /// as far as its create.
+    var publisherCreates: Int {
+        hal.calls.filter { call in
+            if case let .createIOProc(id) = call { return Self.publisherOutputs.contains(id) }
+            return false
+        }.count
+    }
+
+    /// The last create, start, stop or destroy call on a publisher output.
+    var lastPublisherCall: FakeHALLifecycleCalls.Call? {
+        hal.lifecycleCalls.last { call in
+            switch call {
+            case let .createIOProc(id), let .start(id), let .stop(id), let .destroyIOProc(id):
+                return Self.publisherOutputs.contains(id)
+            default:
+                return false
+            }
+        }
+    }
+
     private var progress: [Int] {
         [
             hal.timeline.count,
             lines.values.count,
             scheduler.executed,
-            publisherEngines.engines.count,
             voiceProcessingEngines.callCount
         ]
     }
@@ -738,42 +762,6 @@ final class FakeMicrophoneAuthorization: MicrophoneAuthorization, @unchecked Sen
 
     func requestAccess(_ completion: @escaping (Bool) -> Void) {
         completion(current == .authorized)
-    }
-}
-
-/// Every publisher engine `AudioState` made, in order.
-final class PublisherEngineLog: @unchecked Sendable {
-    private let lock = NSLock()
-    private var made: [FakePublisherEngine] = []
-    private var _prepare: ((FakePublisherEngine) -> Void)?
-
-    /// Runs on each engine as it is made, before `AudioState` uses it.
-    var prepare: ((FakePublisherEngine) -> Void)? {
-        get {
-            lock.lock()
-            defer { lock.unlock() }
-            return _prepare
-        }
-        set {
-            lock.lock()
-            _prepare = newValue
-            lock.unlock()
-        }
-    }
-
-    var engines: [FakePublisherEngine] {
-        lock.lock()
-        defer { lock.unlock() }
-        return made
-    }
-
-    func make() -> FakePublisherEngine {
-        let engine = FakePublisherEngine()
-        prepare?(engine)
-        lock.lock()
-        made.append(engine)
-        lock.unlock()
-        return engine
     }
 }
 

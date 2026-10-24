@@ -22,10 +22,12 @@ import Foundation
 /// The teardown then runs these steps. The level gates of the microphone
 /// meter, the system playback meter and the IOProc capture close first, from
 /// the main thread, so no IO thread processes anything while the process
-/// exits. The processing engines stop next: the publisher engine renders into
-/// the muted process tap the publication captures, so it stops before the
-/// publication is withdrawn, and the IOProc capture's release is handed to
-/// its lifecycle queue at the same point. The publication is withdrawn next,
+/// exits; the publisher's gate is among them, and from then on it renders
+/// silence into the muted process tap the publication captures, so the
+/// publication may be withdrawn before its IOProc has stopped. The processing
+/// engines stop next: Apple voice processing's engine, if one runs, on the
+/// main thread, and the release of the capture's and the publisher's IOProcs
+/// is handed to their lifecycle queue at the same point. The publication is withdrawn next,
 /// refused while a consuming app holds it. The meters' stops are then handed
 /// to their lifecycle queues, and Quit waits for every queued stop while some
 /// stop has finished a HAL call within `lifecycleStopIdleTimeout`, and for at

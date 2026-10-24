@@ -70,13 +70,17 @@ enum HALLifecycleLog {
         case processedMicrophoneProbeIOProc = "processed-microphone-probe-ioproc"
         case processedMicrophoneCaptureIOProc = "processed-microphone-capture-ioproc"
         case processedMicrophoneCaptureListener = "processed-microphone-capture-listener"
-        /// The processed microphone's publisher `AVAudioEngine`. `start`,
-        /// `stop` and `invalidate` carry the output device its node is bound
-        /// to, read back from the node's audio unit. `refuse`: the read made
-        /// immediately before it is built found no output it may be bound
-        /// to, and nothing was built; the ID and transport are the default
-        /// output's.
-        case processedMicrophonePublisherEngine = "processed-microphone-publisher-engine"
+        /// The processed microphone's publisher: an IOProc on the output
+        /// device it is bound to, which renders the processed signal, muted
+        /// by the public tap. Its lines carry that device. `refuse`: the read
+        /// made before anything is created found no output it may be bound
+        /// to, and the ID and transport are then the default output's; or the
+        /// bound output, read again immediately before the create or the
+        /// start, no longer qualifies, and the ID is the bound output's.
+        /// `invalidate`: a listener on the bound output reported it dead or
+        /// reconfigured.
+        case processedMicrophonePublisherIOProc = "processed-microphone-publisher-ioproc"
+        case processedMicrophonePublisherListener = "processed-microphone-publisher-listener"
         /// The processed microphone's Apple voice processing capture
         /// `AVAudioEngine`. Its lines carry the input device its unit is bound
         /// to as `id=`, and the device its output element is bound to as
@@ -179,7 +183,7 @@ enum HALLifecycleLog {
         /// meter (`system-output-tap`, id 0, with `output=`) at
         /// `SystemOutputRecovery.maximumConsecutiveInvalidations`
         /// invalidations in a row, and for the processed microphone
-        /// (`processed-microphone-publisher-engine`, the output's ID and its
+        /// (`processed-microphone-publisher-ioproc`, the output's ID and its
         /// transport class as the poll shows it, or `unread`) at
         /// `PublisherOutputRetry.maximumConsecutiveFailures` unusable format
         /// reads in a row on that output.
@@ -244,9 +248,9 @@ enum HALLifecycleLog {
     /// window does not hold.
     static let quitReason = "quit"
 
-    /// The `reason` on the stop of Apple voice processing's capture and
-    /// publisher engines that the app's own device picker issues before it
-    /// writes a default device that may involve Bluetooth. The quiet window
+    /// The `reason` on the stop of Apple voice processing's capture engine
+    /// that the app's own device picker issues before it writes a default
+    /// device that may involve Bluetooth. The quiet window
     /// does not hold it: it comes before the change it is for.
     static let bluetoothSelectionReason = "bluetooth-selection"
 

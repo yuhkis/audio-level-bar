@@ -23,13 +23,13 @@ enum ProcessedMicrophoneEngineError: LocalizedError {
     /// a default that moves once the start has built something asks for a
     /// restart instead (`RestartReason.sourceChanged`). Nothing was started.
     case voiceProcessingSourceChanged(VoiceProcessingDeviceCheck)
-    /// The output the start rendered to, the publisher engine's or the one
+    /// The output the start rendered to, the publisher's or the one
     /// Apple voice processing opens, read no usable hardware format, as a
     /// device being reconfigured or removed does, or the publisher's output
     /// was no longer eligible when read again before its start. The ID is
     /// that output. Nothing was started.
     case outputUnavailable(AudioDeviceID)
-    /// The read made immediately before the publisher engine is built found
+    /// The read made immediately before the publisher is built found
     /// no output it may be bound to. Nothing was started.
     case publisherOutputRefused(PublisherOutputRefusal)
 
@@ -67,24 +67,27 @@ enum ProcessedMicrophoneEngineError: LocalizedError {
 /// not start that mode while either of them involves Bluetooth, and the engine
 /// reads both defaults again, uncached, immediately before starting it.
 ///
-/// The publisher engine is intentionally separate from the capture. A direct
+/// The publisher is intentionally separate from the capture. A direct
 /// input-to-output connection on the voice-processing engine would feed the
 /// microphone uplink into its own echo-cancellation reference. The owner must
-/// arrange for the publisher engine's process audio to be captured and muted
+/// arrange for the publisher's process audio to be captured and muted
 /// before calling `start`; otherwise the processed microphone is audible
 /// through the output device the publisher is bound to.
 ///
-/// The publisher engine never follows the default output. Immediately before
-/// it is built, the output devices and the default output are read uncached on
-/// the lifecycle queue, and its output node is bound to the device
-/// `PublisherOutputPolicy` chooses: a built-in output, or else a default output
-/// known not to involve Bluetooth. With neither, the start is refused.
+/// The publisher never follows the default output. It is a HAL IOProc on one
+/// output device, created and started on the capture's lifecycle queue like
+/// the capture, and nothing in it is an `AVAudioEngine`, so no default-device
+/// aggregate is made for it and no framework moves it. Before the start, the
+/// output devices and the default output are read uncached on the lifecycle
+/// queue, and the IOProc is created on the device `PublisherOutputPolicy`
+/// chooses: a built-in output, or else a default output known not to involve
+/// Bluetooth. With neither, the start is refused.
 ///
 /// While this engine is running, the owner should stop `MicrophoneMeter` and use
 /// `onInputLevel` / `onOutputLevel` for metering. Lifecycle methods are expected
 /// to be called from the main thread, matching the rest of the app's audio
-/// state management. The IOProc capture is created, started, stopped and
-/// destroyed on its own lifecycle queue, and `onStarted` or `onError` arrives
+/// state management. The IOProcs are created, started, stopped and destroyed
+/// on their own lifecycle queue, and `onStarted` or `onError` arrives
 /// on the main thread once that has happened.
 final class ProcessedMicrophoneEngine {
     struct Configuration: Equatable {
@@ -179,14 +182,14 @@ final class ProcessedMicrophoneEngine {
     var runsVoiceProcessing: Bool {
         isRunning && configuration.processingMode == .apple
     }
-    /// The output device the running publisher engine is bound to, nil while
-    /// none is built. The owner rebuilds the engines once the poll shows this
+    /// The output device the running publisher is bound to, nil while none
+    /// is built. The owner rebuilds the engines once the poll shows this
     /// device gone or involving Bluetooth.
     var publisherOutputDeviceID: AudioDeviceID? {
         boundPublisherOutput?.deviceID
     }
-    /// The output the running publisher engine was bound to, as read before
-    /// it started, for its log lines.
+    /// The output the running publisher was bound to, as read before it
+    /// started, for its log lines.
     private var boundPublisherOutput: PublisherOutput?
     /// The input the running Apple voice processing engine started on, as
     /// read before it started, for its log lines.
@@ -198,11 +201,6 @@ final class ProcessedMicrophoneEngine {
     /// Whether the capture engine held in `captureEngine` has its input tap
     /// installed.
     private var voiceProcessingTapInstalled = false
-    /// Whether the publisher engine held in `publisherEngine` had its start
-    /// issued. A start interrupted before the publisher's start keeps a
-    /// publisher that never started, and its release writes no stop lines
-    /// for it.
-    private var publisherEngineStarted = false
     /// Starts an AVFAudio raise ended in a row, with no start reported in
     /// between.
     private var consecutiveEngineRaises = 0
@@ -212,12 +210,11 @@ final class ProcessedMicrophoneEngine {
     static let maximumConsecutiveEngineRaises = 4
 
     private let gainScalar = ProcessedMicrophoneAtomicFloat(1)
-    /// The IOProc capture for processing off and WebRTC.
+    /// The IOProc capture for processing off and WebRTC, and the publisher's
+    /// IOProc in every mode.
     private let deviceCapture: ProcessedMicrophoneDeviceCapture
     /// The voice-processing capture for Apple voice processing.
     private var captureEngine: (any VoiceProcessingCaptureEngine)?
-    private var publisherEngine: (any ProcessedMicrophonePublisherEngine)?
-    private var publisherSourceNode: AVAudioSourceNode?
     private var ringBuffer: ProcessedMicrophoneRingBuffer?
     private var tapContext: ProcessedMicrophoneTapContext?
     private var configurationObservers: [NSObjectProtocol] = []
@@ -228,16 +225,12 @@ final class ProcessedMicrophoneEngine {
     /// The quiet-window generation the current start was issued in.
     private var holdToken: UInt64 = 0
     private let halCalls: any HALLifecycleCalls
-    /// Makes the publisher's engine. `AVAudioPublisherEngine` in the app; a
-    /// test substitutes one that opens no device.
-    private let makePublisherEngine: () -> any ProcessedMicrophonePublisherEngine
     /// Makes Apple voice processing's capture engine.
     /// `AVAudioVoiceProcessingEngine` in the app; a test substitutes one that
     /// opens no device.
     private let makeVoiceProcessingEngine: () -> any VoiceProcessingCaptureEngine
 
-    /// Main thread. The engines Quit stopped, with the source nodes attached
-    /// to them. Never emptied, so no `-[AVAudioEngine dealloc]` runs during
+    /// Main thread. The engines Quit stopped. Never emptied, so no `-[AVAudioEngine dealloc]` runs during
     /// Quit's teardown or before the process exits.
     ///
     /// A stopped engine's I/O unit keeps its own property listener, and
@@ -248,8 +241,7 @@ final class ProcessedMicrophoneEngine {
     /// A2DP negotiation keeps changing both, and a crash there ends the
     /// process before the publication is withdrawn.
     private static var enginesKeptUntilExit: [AnyObject] = []
-    /// Main thread. Engines stopped outside Quit, with their source nodes,
-    /// kept for the same reason until an evaluation that admits starts, when
+    /// Main thread. Engines stopped outside Quit, kept for the same reason until an evaluation that admits starts, when
     /// no change can be under way, calls `releaseRetiredEngines()`.
     private var retiredEngines: [AnyObject] = []
 
@@ -287,12 +279,10 @@ final class ProcessedMicrophoneEngine {
     init(
         halCalls: any HALLifecycleCalls,
         holdGeneration: LifecycleHoldGeneration,
-        makePublisherEngine: @escaping () -> any ProcessedMicrophonePublisherEngine,
         makeVoiceProcessingEngine: @escaping () -> any VoiceProcessingCaptureEngine
     ) {
         self.halCalls = halCalls
         self.holdGeneration = holdGeneration
-        self.makePublisherEngine = makePublisherEngine
         self.makeVoiceProcessingEngine = makeVoiceProcessingEngine
         deviceCapture = ProcessedMicrophoneDeviceCapture(
             halCalls: halCalls,
@@ -343,35 +333,65 @@ final class ProcessedMicrophoneEngine {
         return true
     }
 
-    /// Stops the engines on the main thread, and releases the IOProc capture
-    /// on its lifecycle queue.
+    /// Releases the IOProcs, the capture's and the publisher's, on their
+    /// lifecycle queue, and stops Apple voice processing's engine, if there
+    /// is one, on the main thread.
+    ///
+    /// The publisher's gate is closed synchronously before this returns:
+    /// from its next IO cycle on it renders silence, so the owner may
+    /// withdraw the muted tap as soon as this returns true, while the
+    /// IOProc's stop still waits on the queue.
     ///
     /// Like a start, a stop carries the quiet window's generation its issuer
     /// saw, not the one current when it runs: a listener can advance the
     /// generation on its own queue before the main thread hears of the
     /// change, and a stop that took the live value would pass every check
-    /// inside the window that advance belongs to. The capture's release
-    /// compares the generation immediately before each of its HAL calls. The
-    /// engines' stops compare it here: when it is no longer current, neither
-    /// the voice-processing engine nor the publisher is stopped. They stay as
-    /// they are, an `interrupt-stop` line is written for each, and this
-    /// engine counts as running again with a restart owed
+    /// inside the window that advance belongs to. The IOProcs' release
+    /// compares the generation immediately before each of its HAL calls, and
+    /// what it holds back stays, its gates closed, with this engine counted as
+    /// running again and a restart owed. The voice-processing engine's stop
+    /// compares it here: when it is no longer current, the engine is not
+    /// stopped. It stays as it is, an `interrupt-stop` line is written for it,
+    /// and this engine counts as running again with a restart owed
     /// (`RestartReason.stopInterrupted`), so the owner's evaluation after the
-    /// window stops them, as it stops what an interrupted start kept.
+    /// window stops it, as it stops what an interrupted start kept.
     ///
     /// - Parameters:
     ///   - reason: `bluetooth-selection` for the stop the app's own picker
     ///     issues before a default write, which the quiet window does not
-    ///     hold; the engines' stop lines carry it.
+    ///     hold; the voice-processing engine's stop lines carry it.
     ///   - issuedToken: The generation the owner's evaluation issued the stop
     ///     in. nil for a stop that is not compared: the picker's, and the one
     ///     deallocation makes, whose lines carry the generation current then.
-    /// - Returns: False when the engines' stop was held back. The publisher
-    ///   may then still render into the muted tap, so the owner must not
+    /// - Returns: False when the voice-processing engine's stop was held
+    ///   back. Its I/O unit may then still run, so the owner must not
     ///   withdraw the publication.
     @discardableResult
     func stop(reason: String? = nil, holdToken issuedToken: UInt64? = nil) -> Bool {
-        stop(reason: reason, holdToken: issuedToken, loggingAnInterruptionAs: .interruptStop)
+        if reason == HALLifecycleLog.bluetoothSelectionReason {
+            stopVoiceProcessingBeforeDefaultWrite()
+            return true
+        }
+        return stop(reason: reason, holdToken: issuedToken, loggingAnInterruptionAs: .interruptStop)
+    }
+
+    /// The picker's stop before a default write that may involve Bluetooth
+    /// (`bluetooth-selection`): only Apple voice processing's engine, which
+    /// follows the defaults, is stopped, synchronously. The IOProcs are not
+    /// released: nothing is queued that could reach coreaudiod while the
+    /// write's change begins. The publisher, on an output that never follows
+    /// the default, has its gate closed and renders silence, and this engine
+    /// counts as running with a restart owed, so the owner's evaluation after
+    /// the window that write arms releases it. The owner is not called back
+    /// here: the write arms that window right after this returns.
+    private func stopVoiceProcessingBeforeDefaultWrite() {
+        let keptOutput = boundPublisherOutput
+        endSession()
+        deviceCapture.closePublisherGate()
+        stopEngines(reason: HALLifecycleLog.bluetoothSelectionReason)
+        boundPublisherOutput = keptOutput
+        isRunning = true
+        needsRestart = true
     }
 
     /// - Parameter interruption: `interrupt-stop` for a stop the owner issued,
@@ -383,26 +403,39 @@ final class ProcessedMicrophoneEngine {
         loggingAnInterruptionAs interruption: HALLifecycleLog.Operation
     ) -> Bool {
         endSession()
-        let releaseSession = sessionID
-        // The IOProc is stopped and destroyed on the capture's lifecycle
-        // queue, and the storage its block reads is released only after that.
-        // A quiet window that arms before the queue gets there leaves it in
-        // place; this engine then counts as running again, so that the owner
-        // releases it after the window.
+        // The voice-processing engine first, as its IO feeds the publisher's
+        // ring; the IOProcs' release is issued after it, so a window that
+        // arms inside the engine's stop holds that release back too.
+        let stopped = stopEngines(reason: reason, holdToken: issuedToken, loggingAnInterruptionAs: interruption)
+        releaseIOProcs(session: sessionID, holdToken: issuedToken ?? holdGeneration.current)
+        return stopped
+    }
+
+    /// Main thread. Closes the publisher's gate, and has the lifecycle queue
+    /// stop and destroy the IOProcs under `session`; the storage their blocks
+    /// read is released only after that. A quiet window that arms before the
+    /// queue gets there leaves them in place; this engine then counts as
+    /// running again, so that the owner releases them after the window.
+    private func releaseIOProcs(session releaseSession: UUID, holdToken: UInt64) {
         deviceCapture.release(
             session: releaseSession,
-            holdToken: issuedToken ?? holdGeneration.current
+            holdToken: holdToken
         ) { [weak self] in
             DispatchQueue.main.async { [weak self] in
                 self?.deviceCaptureReleaseInterrupted(sessionID: releaseSession)
             }
         }
-        return stopEngines(reason: reason, holdToken: issuedToken, loggingAnInterruptionAs: interruption)
     }
 
     /// The capture's lifecycle queue, for a test to wait for.
     var captureQueue: DispatchQueue {
         deviceCapture.queue
+    }
+
+    /// Tests only. The publisher IOProc's context last created, while it is
+    /// alive.
+    var livePublisherContextForTesting: ProcessedMicrophonePublisherContext? {
+        deviceCapture.livePublisherContext
     }
 
     /// Main thread. Calls `body` on the main thread once the capture's
@@ -415,9 +448,10 @@ final class ProcessedMicrophoneEngine {
         }
     }
 
-    /// coreaudiod restarted. The IOProc capture is dropped without a HAL call,
-    /// and engines that were running owe a restart, which the owner carries
-    /// out after the quiet window; `stop()` stops the AVAudioEngines then.
+    /// coreaudiod restarted. The IOProcs are dropped without a HAL call, and
+    /// engines that were running owe a restart, which the owner carries out
+    /// after the quiet window; `stop()` stops the voice-processing engine
+    /// then.
     func noteServiceRestarted() {
         deviceCapture.forgetAfterServiceRestart()
         if isRunning {
@@ -425,9 +459,11 @@ final class ProcessedMicrophoneEngine {
         }
     }
 
-    /// Quit only. Stops the engines as `stop()` does, the publisher before
-    /// the owner withdraws its muted tap, and releases the IOProc capture on
-    /// its lifecycle queue, whatever the quiet window, counted in `stops`.
+    /// Quit only. Releases the IOProcs on their lifecycle queue, whatever the
+    /// quiet window, counted in `stops`, and stops the voice-processing
+    /// engine as `stop()` does. The publisher's gate is already closed
+    /// (`closeCaptureGateAtQuit()`), so the owner may withdraw its muted tap
+    /// before the queue has stopped it.
     func stopAtQuit(in stops: LifecycleStopGroup) {
         endSession()
         deviceCapture.releaseAtQuit(in: stops)
@@ -437,9 +473,9 @@ final class ProcessedMicrophoneEngine {
         retiredEngines.removeAll()
     }
 
-    /// Main thread, Quit only. Closes the IOProc capture's gate, so its IO
-    /// thread passes nothing to WebRTC or the ring buffer while the process
-    /// exits.
+    /// Main thread, Quit only. Closes the IOProcs' gates: the capture passes
+    /// nothing to WebRTC or the ring buffer, and the publisher renders
+    /// silence, while the process exits.
     func closeCaptureGateAtQuit() {
         deviceCapture.closeGateAtQuit()
     }
@@ -452,8 +488,8 @@ final class ProcessedMicrophoneEngine {
         sessionID = UUID()
     }
 
-    /// Stops the AVAudioEngines synchronously and drops what the session
-    /// built. The IOProc capture is released separately.
+    /// Stops the voice-processing engine synchronously, if there is one, and
+    /// drops what the session built. The IOProcs are released separately.
     ///
     /// - Parameters:
     ///   - reason: `quit` at Quit, or `bluetooth-selection` before the
@@ -463,7 +499,7 @@ final class ProcessedMicrophoneEngine {
     ///     `stop(reason:holdToken:)`. Not compared for `reason`s the quiet
     ///     window does not hold.
     ///   - interruption: What a stop held back is logged as.
-    /// - Returns: False when the stop was held back and the engines kept.
+    /// - Returns: False when the stop was held back and the engine kept.
     @discardableResult
     private func stopEngines(
         reason: String? = nil,
@@ -476,9 +512,9 @@ final class ProcessedMicrophoneEngine {
             !unheld,
             let issuedToken,
             !holdGeneration.isCurrent(issuedToken),
-            captureEngine != nil || publisherEngine != nil
+            captureEngine != nil
         {
-            keepEnginesWhoseStopWasHeldBack(holdToken: issuedToken, loggingItAs: interruption)
+            keepEngineWhoseStopWasHeldBack(holdToken: issuedToken, loggingItAs: interruption)
             return false
         }
         // A stop that raises is dropped: the engine is released either way,
@@ -519,62 +555,16 @@ final class ProcessedMicrophoneEngine {
         // returned, so its C processor and scratch storage cannot be freed
         // while the callback is still using them.
         tapContext = nil
-        if
-            !unheld,
-            let issuedToken,
-            captureEngine != nil,
-            publisherEngine != nil,
-            !holdGeneration.isCurrent(issuedToken)
-        {
-            // Apple voice processing has two engines, and the capture
-            // engine's stop above can wait in coreaudiod while a device
-            // change begins, which is when a listener advances the
-            // generation. The publisher's stop is an IO stop of its own, so it
-            // is compared again rather than made inside that window.
-            keepPublisherWhoseStopWasHeldBack(holdToken: issuedToken, loggingItAs: interruption)
-            return false
-        }
-        if let publisherEngine {
-            // A publisher an interrupted start kept before its start is
-            // stopped too, without lines claiming an IO stop.
-            let started = publisherEngineStarted
-            let expected = boundPublisherOutput.map { (deviceID: $0.deviceID, transport: $0.transport) }
-            if started {
-                recordEngine(
-                    .processedMicrophonePublisherEngine,
-                    .stopBegin,
-                    publisher: publisherEngine,
-                    expected: expected,
-                    generation: generation,
-                    reason: reason
-                )
-            }
-            let stopped = (try? catchingObjCException { publisherEngine.stop() }) != nil
-            if started {
-                recordEngine(
-                    .processedMicrophonePublisherEngine,
-                    .stop,
-                    publisher: publisherEngine,
-                    expected: expected,
-                    status: stopped ? noErr : kAudioHardwareUnspecifiedError,
-                    generation: generation,
-                    reason: reason
-                )
-            }
-        }
-        publisherEngineStarted = false
 
         // Stopped, not freed: a change may still be under way, and the
-        // engines' I/O units still call back into them.
+        // engine's I/O unit still calls back into it.
         retire(
-            [captureEngine.map { $0 as AnyObject }, publisherEngine.map { $0 as AnyObject }, publisherSourceNode],
+            [captureEngine.map { $0 as AnyObject }],
             atQuit: reason == HALLifecycleLog.quitReason
         )
         captureEngine = nil
         voiceProcessingEngineStarted = false
         voiceProcessingTapInstalled = false
-        publisherEngine = nil
-        publisherSourceNode = nil
         boundPublisherOutput = nil
         voiceProcessingInput = nil
         ringBuffer = nil
@@ -584,16 +574,16 @@ final class ProcessedMicrophoneEngine {
         return true
     }
 
-    /// A quiet window armed after the stop was issued, before its engine
-    /// stops were made. Stopping an `AVAudioEngine` is an IO stop on the
-    /// device it is bound to, which the window holds like any other, so
-    /// neither engine is touched: the capture engine keeps its tap, and the
-    /// publisher keeps rendering into the muted tap, as after an interrupted
-    /// start (`keepVoiceProcessingStart`). The session has ended, so no level
-    /// is reported and no configuration change observed meanwhile. The engine
-    /// counts as running with a restart owed, and the owner is told, so its
-    /// evaluation after the window stops what is kept here.
-    private func keepEnginesWhoseStopWasHeldBack(
+    /// A quiet window armed after the stop was issued, before the
+    /// voice-processing engine's stop was made. Stopping an `AVAudioEngine`
+    /// is an IO stop on the devices it is bound to, which the window holds
+    /// like any other, so the engine is not touched and keeps its tap, as
+    /// after an interrupted start (`keepVoiceProcessingStart`). The session
+    /// has ended, so no level is reported and no configuration change
+    /// observed meanwhile. The engine counts as running with a restart owed,
+    /// and the owner is told, so its evaluation after the window stops what
+    /// is kept here.
+    private func keepEngineWhoseStopWasHeldBack(
         holdToken: UInt64,
         loggingItAs interruption: HALLifecycleLog.Operation
     ) {
@@ -603,47 +593,6 @@ final class ProcessedMicrophoneEngine {
                 interruption,
                 engine: captureEngine,
                 expected: voiceProcessingInput,
-                generation: holdToken
-            )
-        }
-        if let publisherEngine {
-            recordEngine(
-                .processedMicrophonePublisherEngine,
-                interruption,
-                publisher: publisherEngine,
-                expected: boundPublisherOutput.map { (deviceID: $0.deviceID, transport: $0.transport) },
-                generation: holdToken
-            )
-        }
-        isRunning = true
-        hasStarted = false
-        needsRestart = true
-        onNeedsRestart?(.stopInterrupted)
-    }
-
-    /// A quiet window armed while the voice-processing engine's stop was on
-    /// its way, before the publisher's. The capture engine is stopped and
-    /// retired, its tap removed. The publisher is not touched: with nothing
-    /// writing to the ring it renders silence into the muted tap, as after an
-    /// interrupted start. It stays with its source node, its ring and its
-    /// bound output, an `interrupt-stop` line is written for it (`interrupt`
-    /// for a stop a start makes), and the engine counts as running with a
-    /// restart owed, so the owner's evaluation after the window stops it.
-    private func keepPublisherWhoseStopWasHeldBack(
-        holdToken: UInt64,
-        loggingItAs interruption: HALLifecycleLog.Operation
-    ) {
-        retire([captureEngine.map { $0 as AnyObject }])
-        captureEngine = nil
-        voiceProcessingEngineStarted = false
-        voiceProcessingTapInstalled = false
-        voiceProcessingInput = nil
-        if let publisherEngine {
-            recordEngine(
-                .processedMicrophonePublisherEngine,
-                interruption,
-                publisher: publisherEngine,
-                expected: boundPublisherOutput.map { (deviceID: $0.deviceID, transport: $0.transport) },
                 generation: holdToken
             )
         }
@@ -700,8 +649,9 @@ final class ProcessedMicrophoneEngine {
         }
     }
 
-    /// The IOProc exists but has not started. The publisher is built here on
-    /// the main thread, and the IOProc is then started on the lifecycle queue.
+    /// The capture IOProc exists but has not started. On the lifecycle
+    /// queue, the publisher's IOProc is then created and started on the
+    /// output chosen for it, and the capture IOProc started after it.
     private func deviceCapturePrepared(
         _ outcome: ProcessedMicrophoneDeviceCapture.PrepareOutcome,
         sessionID: UUID,
@@ -724,11 +674,11 @@ final class ProcessedMicrophoneEngine {
             prepared = value
         }
 
-        // The publisher engine opens the output chosen for it. Starting it after a
+        // The publisher opens the output chosen for it. Starting it after a
         // quiet window armed, or once the owner no longer wants this start,
         // would be an IO start while a device is still changing. The IOProc
-        // created for it stays, not started, until the owner's restart
-        // releases it after the window.
+        // created for the capture stays, not started, until the owner's
+        // restart releases it after the window.
         guard startMayTakeNextStep(holdToken: holdToken) else {
             HALLifecycleLog.record(
                 .processedMicrophoneCaptureIOProc,
@@ -740,65 +690,6 @@ final class ProcessedMicrophoneEngine {
             return
         }
 
-        let publisher: (engine: any ProcessedMicrophonePublisherEngine, sourceNode: AVAudioSourceNode)
-        do {
-            publisher = try makePublisher(
-                format: prepared.monoFormat,
-                ringBuffer: prepared.ringBuffer,
-                output: prepared.publisherOutput,
-                generation: holdToken,
-                mayProceed: { startMayTakeNextStep(holdToken: holdToken) }
-            )
-        } catch let interrupted as PublisherStartInterrupted {
-            // A quiet window armed, or the owner stopped wanting this start,
-            // while the publisher was being built. Nothing is stopped inside
-            // it: the publisher, prepared or started or neither, and the
-            // IOProc created for this start stay until the owner's restart
-            // releases them after the window.
-            // An AVFAudio call that raised is kept the same way: its device
-            // is being rebound, and that change arms the window here.
-            publisherEngine = interrupted.engine
-            publisherSourceNode = interrupted.sourceNode
-            publisherEngineStarted = interrupted.started
-            boundPublisherOutput = prepared.publisherOutput
-            HALLifecycleLog.record(
-                .processedMicrophoneCaptureIOProc,
-                .interrupt,
-                id: configuration.inputDeviceID,
-                generation: holdToken,
-                reason: interrupted.raised == nil ? nil : HALLifecycleLog.engineRaisedReason
-            )
-            guard let raised = interrupted.raised else {
-                requestRestart(.startInterrupted)
-                return
-            }
-            requestRestart(.configurationChanged)
-            countEngineRaise(raised, sessionID: sessionID)
-            return
-        } catch let ProcessedMicrophoneEngineError.outputUnavailable(outputDeviceID) {
-            // The output reads no usable hardware format: a device is being
-            // reconfigured or removed. Nothing was started. The IOProc created
-            // for this start stays, not started, until the owner's restart
-            // releases it after the quiet window this request arms.
-            requestRestart(.outputUnavailable(outputDeviceID))
-            return
-        } catch let error as ProcessedMicrophoneEngineError {
-            failPreparedDeviceCapture(error, holdToken: holdToken)
-            return
-        } catch {
-            failPreparedDeviceCapture(
-                .operationFailed(
-                    localized("Starting the processed microphone"),
-                    Self.errorDetail(error)
-                ),
-                holdToken: holdToken
-            )
-            return
-        }
-
-        publisherEngine = publisher.engine
-        publisherSourceNode = publisher.sourceNode
-        publisherEngineStarted = true
         boundPublisherOutput = prepared.publisherOutput
         ringBuffer = prepared.ringBuffer
         tapContext = prepared.tapContext
@@ -807,10 +698,36 @@ final class ProcessedMicrophoneEngine {
             ringBuffer: prepared.ringBuffer,
             tapContext: prepared.tapContext
         )
-        installConfigurationObservers(voiceProcessingEngine: nil, publisher: publisher.engine)
 
         let deviceCapture = deviceCapture
+        let ringBuffer = prepared.ringBuffer
+        let publisherOutput = prepared.publisherOutput
+        let inputSampleRate = prepared.monoFormat.sampleRate
         deviceCapture.queue.async { [weak self] in
+            guard let publisherOutcome = deviceCapture.startPublisher(
+                output: publisherOutput,
+                ringBuffer: ringBuffer,
+                inputSampleRate: inputSampleRate,
+                session: sessionID,
+                holdToken: holdToken,
+                onInvalidated: { [weak self] in
+                    DispatchQueue.main.async { [weak self] in
+                        self?.publisherInvalidated(sessionID: sessionID)
+                    }
+                }
+            ) else {
+                return
+            }
+            guard case .started = publisherOutcome else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.devicePublisherDidNotStart(
+                        publisherOutcome,
+                        sessionID: sessionID,
+                        holdToken: holdToken
+                    )
+                }
+                return
+            }
             guard let outcome = deviceCapture.startIO(
                 session: sessionID,
                 holdToken: holdToken
@@ -825,6 +742,51 @@ final class ProcessedMicrophoneEngine {
                 )
             }
         }
+    }
+
+    /// The publisher of a capture start did not start. Its capture IOProc,
+    /// created and not started, is released by a failure, or kept for the
+    /// owner's restart after the window otherwise.
+    private func devicePublisherDidNotStart(
+        _ outcome: ProcessedMicrophoneDeviceCapture.PublisherStartOutcome,
+        sessionID: UUID,
+        holdToken: UInt64
+    ) {
+        guard self.sessionID == sessionID else {
+            return
+        }
+        switch outcome {
+        case .started:
+            break
+        case .interrupted:
+            requestRestart(.startInterrupted)
+        case let .outputUnavailable(outputDeviceID):
+            // The output reads no usable format, or no longer qualifies: a
+            // device is being reconfigured or removed. Nothing was started.
+            // The capture IOProc created for this start stays, not started,
+            // until the owner's restart releases it after the quiet window
+            // this request arms.
+            requestRestart(.outputUnavailable(outputDeviceID))
+        case let .failed(error):
+            failPreparedDeviceCapture(error, holdToken: holdToken)
+        }
+    }
+
+    /// A listener on the publisher's output reported it dead or
+    /// reconfigured. The publisher already renders silence; the owner
+    /// rebuilds after the window.
+    private func publisherInvalidated(sessionID: UUID) {
+        guard self.sessionID == sessionID else {
+            return
+        }
+        HALLifecycleLog.record(
+            .processedMicrophonePublisherIOProc,
+            .invalidate,
+            id: boundPublisherOutput?.deviceID ?? AudioDeviceID(kAudioObjectUnknown),
+            transport: boundPublisherOutput?.transport ?? "-",
+            generation: holdGeneration.current
+        )
+        requestRestart(.configurationChanged)
     }
 
     private func deviceCaptureStarted(
@@ -857,11 +819,11 @@ final class ProcessedMicrophoneEngine {
         }
     }
 
-    /// A start whose IOProc the capture queue has already released. Failing
-    /// it also stops the publisher engine, synchronously, so that happens
-    /// only while no quiet window has armed since the start was issued.
-    /// Otherwise the publisher keeps rendering silence into the muted tap,
-    /// and the owner's restart after the window stops it.
+    /// A start whose capture IOProc the lifecycle queue has already released.
+    /// Failing it also releases the publisher's IOProc, which happens only
+    /// while no quiet window has armed since the start was issued. Otherwise
+    /// the publisher keeps rendering silence into the muted tap, and the
+    /// owner's restart after the window stops it.
     private func failReleasedDeviceCapture(
         _ error: ProcessedMicrophoneEngineError,
         holdToken: UInt64
@@ -873,18 +835,17 @@ final class ProcessedMicrophoneEngine {
         failDeviceCapture(error, holdToken: holdToken)
     }
 
-    /// A start whose publisher build failed, with its IOProc created and not
-    /// started. Failing it releases that IOProc, and reports a failure that
-    /// turns the processing mode off or halts the feature. The build runs on
-    /// the main thread through calls that wait in coreaudiod while a device
-    /// changes, which is when a listener advances the generation, and a
-    /// build that fails then most likely fails because of that change. So
-    /// when a quiet window has armed since the start was issued, nothing is
-    /// released inside it and nothing is reported: an `interrupt` line is
-    /// written, and the IOProc stays, unstarted, until the owner's restart
-    /// releases it after the window and starts again in the same mode. The
-    /// publisher a failed build made is already stopped or was never started
-    /// (`makePublisher`).
+    /// A start whose publisher failed, with the capture IOProc created and
+    /// not started. Failing it releases that IOProc, and reports a failure
+    /// that turns the processing mode off or halts the feature. The
+    /// publisher's create and start wait in coreaudiod while a device
+    /// changes, which is when a listener advances the generation, and one
+    /// that fails then most likely fails because of that change. So when a
+    /// quiet window has armed since the start was issued, nothing is released
+    /// inside it and nothing is reported: an `interrupt` line is written, and
+    /// the IOProc stays, unstarted, until the owner's restart releases it
+    /// after the window and starts again in the same mode. What the failed
+    /// publisher created the lifecycle queue has already released.
     private func failPreparedDeviceCapture(
         _ error: ProcessedMicrophoneEngineError,
         holdToken: UInt64
@@ -971,7 +932,7 @@ final class ProcessedMicrophoneEngine {
         let bluetoothDevicePresent: Bool?
         /// The first Bluetooth device in that list, for the log.
         let bluetoothOutput: AudioDevice?
-        /// The output the publisher engine is to be bound to, read in the
+        /// The output the publisher is to be bound to, read in the
         /// same turn.
         let publisherOutput: PublisherOutputReading
     }
@@ -986,6 +947,8 @@ final class ProcessedMicrophoneEngine {
     /// is listed.
     private func startVoiceProcessingAfterReadingDevices(sessionID: UUID, holdToken: UInt64) {
         isRunning = true
+        // The publisher's IOProc is created under this session.
+        deviceCapture.begin(session: sessionID)
         let halCalls = halCalls
         deviceCapture.queue.async { [weak self] in
             let inputDeviceID = halCalls.defaultInputDeviceID()
@@ -1072,7 +1035,7 @@ final class ProcessedMicrophoneEngine {
             publisherOutput = output
         case let .refused(refusal, defaultOutputID, defaultTransport):
             HALLifecycleLog.record(
-                .processedMicrophonePublisherEngine,
+                .processedMicrophonePublisherIOProc,
                 .refuse,
                 id: defaultOutputID,
                 transport: defaultTransport,
@@ -1082,9 +1045,6 @@ final class ProcessedMicrophoneEngine {
             return
         }
 
-        // Set again once the engine runs. A failed start reports through
-        // onError with nothing left running.
-        isRunning = false
         startVoiceProcessingCapture(
             sessionID: sessionID,
             holdToken: holdToken,
@@ -1102,16 +1062,18 @@ final class ProcessedMicrophoneEngine {
     /// it.
     private struct VoiceProcessingStartInterrupted: Error {}
 
-    /// Builds and starts Apple voice processing's capture engine, and its
-    /// publisher, on the main thread.
+    /// Builds and starts Apple voice processing's capture engine on the main
+    /// thread, with the publisher's IOProc started on the lifecycle queue in
+    /// between.
     ///
     /// Before each step that opens or starts something, the start checks that
     /// no quiet window has armed since it was issued and that the owner still
-    /// wants it: before the publisher is built, before the tap is installed
+    /// wants it: before the publisher is started, before the tap is installed
     /// and the engine prepared, and once more after the default devices are
     /// read, immediately before the engine starts. A start stopped there
     /// issues nothing more and releases nothing now; what it built stays until
-    /// the owner's restart releases it after the window.
+    /// the owner's restart releases it after the window. The publisher checks
+    /// the generation on its queue as the capture does.
     ///
     /// Voice Processing I/O opens whatever the defaults are when it starts,
     /// so both default devices are read again, uncached, immediately before
@@ -1142,11 +1104,8 @@ final class ProcessedMicrophoneEngine {
         // What the start got as far as, so that a failed start stops it rather
         // than leaving it to deallocation, and an interrupted one keeps it for
         // the release after the window.
-        var tapInstalled = false
         var builtRingBuffer: ProcessedMicrophoneRingBuffer?
         var builtTapContext: ProcessedMicrophoneTapContext?
-        var builtPublisher: (engine: any ProcessedMicrophonePublisherEngine, sourceNode: AVAudioSourceNode)?
-        var captureStartAttempted = false
 
         func proceedOrStop() throws {
             guard startMayTakeNextStep(holdToken: holdToken) else {
@@ -1265,24 +1224,170 @@ final class ProcessedMicrophoneEngine {
             builtTapContext = tapContext
 
             try proceedOrStop()
-            let publisher = try makePublisher(
-                format: monoFormat,
-                ringBuffer: ringBuffer,
-                output: publisherOutput,
-                generation: holdToken,
-                mayProceed: { startMayTakeNextStep(holdToken: holdToken) }
+            startVoiceProcessingPublisher(
+                VoiceProcessingStartInProgress(
+                    captureEngine: captureEngine,
+                    inputFormat: inputFormat,
+                    ringBuffer: ringBuffer,
+                    tapContext: tapContext,
+                    publisherOutput: publisherOutput,
+                    input: input,
+                    outputDeviceID: outputDeviceID
+                ),
+                sessionID: sessionID,
+                holdToken: holdToken
             )
-            builtPublisher = publisher
+        } catch {
+            handleVoiceProcessingStartError(
+                error,
+                built: BuiltVoiceProcessingStart(
+                    captureEngine: captureEngine,
+                    started: false,
+                    tapInstalled: false,
+                    ringBuffer: builtRingBuffer,
+                    tapContext: builtTapContext,
+                    publisherIssued: false,
+                    publisherOutput: publisherOutput,
+                    input: input
+                ),
+                sessionID: sessionID,
+                holdToken: holdToken
+            )
+        }
+    }
 
+    /// An Apple voice processing start whose engine is enabled, bound and
+    /// read, with its ring and tap context made, and whose publisher is
+    /// being started on the lifecycle queue.
+    private struct VoiceProcessingStartInProgress {
+        let captureEngine: any VoiceProcessingCaptureEngine
+        let inputFormat: AVAudioFormat
+        let ringBuffer: ProcessedMicrophoneRingBuffer
+        let tapContext: ProcessedMicrophoneTapContext
+        let publisherOutput: PublisherOutput
+        let input: (deviceID: AudioDeviceID, transport: String)
+        let outputDeviceID: AudioDeviceID
+
+        func built(started: Bool, tapInstalled: Bool, publisherIssued: Bool) -> BuiltVoiceProcessingStart {
+            BuiltVoiceProcessingStart(
+                captureEngine: captureEngine,
+                started: started,
+                tapInstalled: tapInstalled,
+                ringBuffer: ringBuffer,
+                tapContext: tapContext,
+                publisherIssued: publisherIssued,
+                publisherOutput: publisherOutput,
+                input: input
+            )
+        }
+    }
+
+    /// Has the lifecycle queue create and start the publisher's IOProc for an
+    /// Apple voice processing start, and goes on on the main thread once it
+    /// has.
+    private func startVoiceProcessingPublisher(
+        _ start: VoiceProcessingStartInProgress,
+        sessionID: UUID,
+        holdToken: UInt64
+    ) {
+        boundPublisherOutput = start.publisherOutput
+        let deviceCapture = deviceCapture
+        let inputSampleRate = start.inputFormat.sampleRate
+        let ringBuffer = start.ringBuffer
+        let publisherOutput = start.publisherOutput
+        deviceCapture.queue.async { [weak self] in
+            let outcome = deviceCapture.startPublisher(
+                output: publisherOutput,
+                ringBuffer: ringBuffer,
+                inputSampleRate: inputSampleRate,
+                session: sessionID,
+                holdToken: holdToken,
+                onInvalidated: { [weak self] in
+                    DispatchQueue.main.async { [weak self] in
+                        self?.publisherInvalidated(sessionID: sessionID)
+                    }
+                }
+            )
+            DispatchQueue.main.async { [weak self] in
+                self?.voiceProcessingPublisherReported(
+                    outcome,
+                    start,
+                    sessionID: sessionID,
+                    holdToken: holdToken
+                )
+            }
+        }
+    }
+
+    private func voiceProcessingPublisherReported(
+        _ outcome: ProcessedMicrophoneDeviceCapture.PublisherStartOutcome?,
+        _ start: VoiceProcessingStartInProgress,
+        sessionID: UUID,
+        holdToken: UInt64
+    ) {
+        guard self.sessionID == sessionID, let outcome else {
+            // A stop or another start took over, and has the queue release
+            // the publisher. The engine, enabled and never prepared, is
+            // retired rather than freed.
+            retire([start.captureEngine as AnyObject])
+            return
+        }
+        switch outcome {
+        case .started:
+            finishVoiceProcessingCapture(start, sessionID: sessionID, holdToken: holdToken)
+        case .interrupted:
+            keepInterruptedVoiceProcessingStart(
+                start.built(started: false, tapInstalled: false, publisherIssued: true),
+                holdToken: holdToken
+            )
+        case let .outputUnavailable(outputDeviceID):
+            keepVoiceProcessingStart(
+                start.built(started: false, tapInstalled: false, publisherIssued: true),
+                restart: .outputUnavailable(outputDeviceID)
+            )
+        case let .failed(error):
+            handleVoiceProcessingStartError(
+                error,
+                built: start.built(started: false, tapInstalled: false, publisherIssued: false),
+                sessionID: sessionID,
+                holdToken: holdToken
+            )
+        }
+    }
+
+    /// Installs the tap, prepares and starts the voice-processing engine, on
+    /// the main thread, once its publisher has started.
+    private func finishVoiceProcessingCapture(
+        _ start: VoiceProcessingStartInProgress,
+        sessionID: UUID,
+        holdToken: UInt64
+    ) {
+        let captureEngine = start.captureEngine
+        let inputFormat = start.inputFormat
+        let ringBuffer = start.ringBuffer
+        let tapContext = start.tapContext
+        let publisherOutput = start.publisherOutput
+        let input = start.input
+        let outputDeviceID = start.outputDeviceID
+        var tapInstalled = false
+        var captureStartAttempted = false
+
+        func proceedOrStop() throws {
+            guard startMayTakeNextStep(holdToken: holdToken) else {
+                throw VoiceProcessingStartInterrupted()
+            }
+        }
+
+        do {
             let starting = localized("Starting microphone processing")
             let tapFrameCount = AVAudioFrameCount(
                 min(max(inputFormat.sampleRate * 0.02, 512), 1_024)
             )
-            // Starting the publisher can take a while on the main thread.
+            // The publisher's start waited on the lifecycle queue.
             try proceedOrStop()
             tapInstalled = true
             // No format: the node's format at the moment of the install is
-            // used. A format read before the publisher was built can be stale
+            // used. A format read before the publisher started can be stale
             // by now, and AVFAudio raises on a format that no longer matches.
             // The tap context drops a buffer at another rate than the ring's.
             try Self.catchingEngineException(starting) {
@@ -1368,11 +1473,8 @@ final class ProcessedMicrophoneEngine {
             self.captureEngine = captureEngine
             voiceProcessingEngineStarted = true
             voiceProcessingTapInstalled = true
-            publisherEngine = publisher.engine
-            publisherEngineStarted = true
             boundPublisherOutput = publisherOutput
             voiceProcessingInput = input
-            publisherSourceNode = publisher.sourceNode
             self.ringBuffer = ringBuffer
             self.tapContext = tapContext
             isRunning = true
@@ -1382,7 +1484,7 @@ final class ProcessedMicrophoneEngine {
                 ringBuffer: ringBuffer,
                 tapContext: tapContext
             )
-            installConfigurationObservers(voiceProcessingEngine: captureEngine, publisher: publisher.engine)
+            installConfigurationObservers(voiceProcessingEngine: captureEngine)
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.sessionID == sessionID else {
@@ -1392,83 +1494,70 @@ final class ProcessedMicrophoneEngine {
                 self.onStarted?()
             }
         } catch {
-            var keptPublisher = builtPublisher.map {
-                (engine: $0.engine, sourceNode: Optional($0.sourceNode), started: true)
-            }
-            if let interrupted = error as? PublisherStartInterrupted {
-                keptPublisher = (engine: interrupted.engine, sourceNode: interrupted.sourceNode, started: interrupted.started)
-            }
-            let built = BuiltVoiceProcessingStart(
-                captureEngine: captureEngine,
-                started: captureStartAttempted,
-                tapInstalled: tapInstalled,
-                ringBuffer: builtRingBuffer,
-                tapContext: builtTapContext,
-                publisher: keptPublisher,
-                publisherOutput: publisherOutput,
-                input: input
-            )
-            switch error {
-            case let ProcessedMicrophoneEngineError.engineRaised(step, detail):
-                // An AVFAudio call raised: the binding is changing under the
-                // engine, and AVFAudio's own work for that change is under
-                // way. Stopping and freeing the engines now would put both
-                // inside it.
-                keepRaisedVoiceProcessingStart(
-                    built,
-                    raised: (step: step, detail: detail),
-                    holdToken: holdToken,
-                    sessionID: sessionID
-                )
-            case let interrupted as PublisherStartInterrupted:
-                if let raised = interrupted.raised {
-                    keepRaisedVoiceProcessingStart(built, raised: raised, holdToken: holdToken, sessionID: sessionID)
-                } else {
-                    keepInterruptedVoiceProcessingStart(built, holdToken: holdToken)
-                }
-            case is VoiceProcessingStartInterrupted:
-                keepInterruptedVoiceProcessingStart(built, holdToken: holdToken)
-            case let ProcessedMicrophoneEngineError.outputUnavailable(outputDeviceID):
-                // The output read no usable format, as one being reconfigured
-                // or removed does. Nothing started, and nothing is released
-                // inside that change, as for the IOProc capture: the owner's
-                // restart releases it after the window this request arms.
-                keepVoiceProcessingStart(built, restart: .outputUnavailable(outputDeviceID))
-            case ProcessedMicrophoneEngineError.voiceProcessingSourceChanged:
-                // A default moved immediately before or while the engine
-                // started, and the move is already logged. Stopping the
-                // engines now would put their stops inside that change.
-                keepVoiceProcessingStart(built, restart: .sourceChanged)
-            default:
-                guard holdGeneration.isCurrent(holdToken) else {
-                    // A window armed while the start was on its way: its
-                    // release would be inside that window.
-                    keepInterruptedVoiceProcessingStart(built, holdToken: holdToken)
-                    return
-                }
-                guard releaseFailedVoiceProcessingStart(
-                    captureEngine: captureEngine,
-                    generation: holdToken,
-                    captureStartAttempted: captureStartAttempted,
-                    input: input,
+            handleVoiceProcessingStartError(
+                error,
+                built: start.built(
+                    started: captureStartAttempted,
                     tapInstalled: tapInstalled,
-                    ringBuffer: builtRingBuffer,
-                    publisher: builtPublisher,
-                    publisherOutput: publisherOutput
-                ) else {
-                    // A window armed inside the capture engine's stop, and the
-                    // publisher is kept for the release after it. Not reported
-                    // as a failure, as for a start a window interrupted.
-                    return
-                }
-                report(
-                    error as? ProcessedMicrophoneEngineError ?? .operationFailed(
-                        localized("Starting the processed microphone"),
-                        Self.errorDetail(error)
-                    ),
-                    sessionID: sessionID
-                )
+                    publisherIssued: true
+                ),
+                sessionID: sessionID,
+                holdToken: holdToken
+            )
+        }
+    }
+
+    /// What becomes of a voice-processing start that threw.
+    private func handleVoiceProcessingStartError(
+        _ error: Error,
+        built: BuiltVoiceProcessingStart,
+        sessionID: UUID,
+        holdToken: UInt64
+    ) {
+        switch error {
+        case let ProcessedMicrophoneEngineError.engineRaised(step, detail):
+            // An AVFAudio call raised: the binding is changing under the
+            // engine, and AVFAudio's own work for that change is under way.
+            // Stopping and freeing the engine now would put it inside it.
+            keepRaisedVoiceProcessingStart(
+                built,
+                raised: (step: step, detail: detail),
+                holdToken: holdToken,
+                sessionID: sessionID
+            )
+        case is VoiceProcessingStartInterrupted:
+            keepInterruptedVoiceProcessingStart(built, holdToken: holdToken)
+        case let ProcessedMicrophoneEngineError.outputUnavailable(outputDeviceID):
+            // The output read no usable format, as one being reconfigured or
+            // removed does. Nothing started, and nothing is released inside
+            // that change, as for the IOProc capture: the owner's restart
+            // releases it after the window this request arms.
+            keepVoiceProcessingStart(built, restart: .outputUnavailable(outputDeviceID))
+        case ProcessedMicrophoneEngineError.voiceProcessingSourceChanged:
+            // A default moved immediately before or while the engine started,
+            // and the move is already logged. Stopping the engine now would
+            // put its stop inside that change.
+            keepVoiceProcessingStart(built, restart: .sourceChanged)
+        default:
+            guard holdGeneration.isCurrent(holdToken) else {
+                // A window armed while the start was on its way: its release
+                // would be inside that window.
+                keepInterruptedVoiceProcessingStart(built, holdToken: holdToken)
+                return
             }
+            guard releaseFailedVoiceProcessingStart(built, generation: holdToken, sessionID: sessionID) else {
+                // A window armed inside the engine's stop, and the publisher
+                // is kept for the release after it. Not reported as a
+                // failure, as for a start a window interrupted.
+                return
+            }
+            report(
+                error as? ProcessedMicrophoneEngineError ?? .operationFailed(
+                    localized("Starting the processed microphone"),
+                    Self.errorDetail(error)
+                ),
+                sessionID: sessionID
+            )
         }
     }
 
@@ -1511,8 +1600,9 @@ final class ProcessedMicrophoneEngine {
         let tapInstalled: Bool
         let ringBuffer: ProcessedMicrophoneRingBuffer?
         let tapContext: ProcessedMicrophoneTapContext?
-        /// With whether the publisher's start was issued.
-        let publisher: (engine: any ProcessedMicrophonePublisherEngine, sourceNode: AVAudioSourceNode?, started: Bool)?
+        /// Whether the publisher's start was issued to the lifecycle queue,
+        /// which then holds what it created until a release.
+        let publisherIssued: Bool
         let publisherOutput: PublisherOutput
         let input: (deviceID: AudioDeviceID, transport: String)
     }
@@ -1554,8 +1644,9 @@ final class ProcessedMicrophoneEngine {
     /// Keeps what a start that did not complete built, and asks the owner
     /// for a restart. Nothing further is issued, and nothing is stopped now:
     /// the capture engine stays as it is, started or not, with its tap if one
-    /// was installed, and the publisher keeps rendering silence into the
-    /// muted tap if it was started. No level timer runs and no start is
+    /// was installed, and the publisher's IOProc, if its start was issued,
+    /// stays on the lifecycle queue as far as it got, rendering silence into
+    /// the muted tap if it started. No level timer runs and no start is
     /// reported. The engine counts as running with a restart owed, so the
     /// owner stops everything after the window, with stop lines only for an
     /// engine whose start was issued.
@@ -1564,10 +1655,7 @@ final class ProcessedMicrophoneEngine {
         voiceProcessingEngineStarted = built.started
         voiceProcessingTapInstalled = built.tapInstalled
         voiceProcessingInput = built.input
-        if let publisher = built.publisher {
-            publisherEngine = publisher.engine
-            publisherSourceNode = publisher.sourceNode
-            publisherEngineStarted = publisher.started
+        if built.publisherIssued {
             boundPublisherOutput = built.publisherOutput
         }
         ringBuffer = built.ringBuffer
@@ -1578,268 +1666,6 @@ final class ProcessedMicrophoneEngine {
     }
 
     // MARK: Shared
-
-    /// Builds and starts the publisher engine, bound to `output`.
-    ///
-    /// Every AVFAudio call goes through `catchingEngineException`, and the
-    /// output's hardware format is checked before anything is connected to
-    /// it. A device being reconfigured or removed reads 0 Hz or no channels,
-    /// and AVAudioEngine raises an exception, rather than failing, when it is
-    /// connected or started against that.
-    ///
-    /// - Throws: `outputUnavailable` for an output with no usable format, and
-    ///   `operationFailed` for a failed or raising call, and for an output
-    ///   node that could not be bound to `output`. Nothing is left running
-    ///   either way, and the engine a failed build made is stopped but not
-    ///   freed (`retire`).
-    ///
-    /// - Parameter mayProceed: Asked immediately before the output is bound,
-    ///   before the engine is prepared, before it is started, and before a
-    ///   start that failed is stopped: whether no quiet window has armed
-    ///   since the start was issued and the owner still wants it. The reads
-    ///   before each of those block while coreaudiod is busy with a
-    ///   configuration change, and a listener can advance the generation
-    ///   meanwhile. When it says no, nothing more is called, nothing is
-    ///   stopped, and `PublisherStartInterrupted` hands the engine to the
-    ///   caller, which keeps it for the release after the window.
-    func makePublisher(
-        format: AVAudioFormat,
-        ringBuffer: ProcessedMicrophoneRingBuffer,
-        output: PublisherOutput,
-        generation: UInt64,
-        mayProceed: () -> Bool = { true }
-    ) throws -> (engine: any ProcessedMicrophonePublisherEngine, sourceNode: AVAudioSourceNode) {
-        let engine = makePublisherEngine()
-        let progress = PublisherBuildProgress()
-        do {
-            return try buildPublisher(
-                engine,
-                format: format,
-                ringBuffer: ringBuffer,
-                output: output,
-                generation: generation,
-                mayProceed: mayProceed,
-                progress: progress
-            )
-        } catch let interrupted as PublisherStartInterrupted {
-            throw interrupted
-        } catch let ProcessedMicrophoneEngineError.engineRaised(step, detail) {
-            // AVFAudio raises while a device is rebound under the engine, and
-            // its own listener work for that change is then under way:
-            // neither stopped nor freed now.
-            throw PublisherStartInterrupted(
-                engine: engine,
-                sourceNode: progress.sourceNode,
-                started: progress.startIssued,
-                raised: (step: step, detail: detail)
-            )
-        } catch {
-            // The engine keeps the source node it attached.
-            retire([engine as AnyObject])
-            throw error
-        }
-    }
-
-    /// A publisher build that stopped before its next step, because a quiet
-    /// window armed after the start was issued, the owner no longer wants
-    /// it, or an AVFAudio call raised. Nothing was stopped: the caller keeps
-    /// `engine`, and the source node attached to it, until the release after
-    /// the window stops it, with stop lines only when `started`.
-    struct PublisherStartInterrupted: Error {
-        let engine: any ProcessedMicrophonePublisherEngine
-        let sourceNode: AVAudioSourceNode?
-        /// Whether the engine's start was issued.
-        let started: Bool
-        /// The step whose AVFAudio call raised, and the exception; nil when a
-        /// quiet window armed or the owner stopped wanting the start.
-        var raised: (step: String, detail: String)?
-    }
-
-    /// How far a publisher build got, for a build an AVFAudio raise ended.
-    private final class PublisherBuildProgress {
-        var sourceNode: AVAudioSourceNode?
-        var startIssued = false
-    }
-
-    private func buildPublisher(
-        _ engine: any ProcessedMicrophonePublisherEngine,
-        format: AVAudioFormat,
-        ringBuffer: ProcessedMicrophoneRingBuffer,
-        output: PublisherOutput,
-        generation: UInt64,
-        mayProceed: () -> Bool,
-        progress: PublisherBuildProgress
-    ) throws -> (engine: any ProcessedMicrophonePublisherEngine, sourceNode: AVAudioSourceNode) {
-        let operation = localized("Starting processed microphone output")
-        let binding = localized("Selecting the processed microphone output device")
-        try Self.catchingEngineException(binding) {
-            engine.loadOutputNode()
-        }
-        guard mayProceed() else {
-            throw PublisherStartInterrupted(engine: engine, sourceNode: nil, started: false)
-        }
-
-        // Bound before anything reads the output's format or connects to it,
-        // so the engine never opens the default output and cannot follow it
-        // onto a Bluetooth headset. This is AUAudioUnit's device selection for
-        // an I/O unit on macOS, reached through the node's auAudioUnit, and
-        // the ID read back must be the chosen device.
-        var bindError: Error?
-        try Self.catchingEngineException(binding) {
-            do {
-                try engine.bindOutput(to: output.deviceID)
-            } catch {
-                bindError = error
-            }
-        }
-        if let bindError {
-            throw ProcessedMicrophoneEngineError.operationFailed(
-                binding,
-                Self.errorDetail(bindError)
-            )
-        }
-        let boundDeviceID = try Self.catchingEngineException(binding) {
-            engine.boundOutputDeviceID
-        }
-        guard boundDeviceID == output.deviceID else {
-            throw ProcessedMicrophoneEngineError.operationFailed(
-                binding,
-                "the output is device \(boundDeviceID), not \(output.deviceID)"
-            )
-        }
-
-        let outputFormat = try Self.catchingEngineException(operation) {
-            engine.outputFormat()
-        }
-        guard
-            outputFormat.sampleRate.isFinite,
-            outputFormat.sampleRate > 0,
-            outputFormat.channelCount > 0
-        else {
-            throw ProcessedMicrophoneEngineError.outputUnavailable(output.deviceID)
-        }
-
-        let sourceNode = try Self.catchingEngineException(operation) {
-            AVAudioSourceNode(format: format) {
-                isSilence, _, frameCount, outputData in
-                let framesRead = ringBuffer.read(
-                    into: outputData,
-                    frameCount: Int(frameCount)
-                )
-                isSilence.pointee = ObjCBool(framesRead == 0)
-                return noErr
-            }
-        }
-        progress.sourceNode = sourceNode
-        let expected = (deviceID: output.deviceID, transport: output.transport)
-        try Self.catchingEngineException(operation) {
-            engine.attachAndConnect(sourceNode, format: format)
-        }
-        // The output was read on a lifecycle queue, and the start has hopped
-        // to the main thread since. An output other than a built-in one, such
-        // as an aggregate default output, can gain a Bluetooth sub-device in
-        // between with no default or topology change the window sees. Its
-        // transport is read again now, uncached, on the main thread, before
-        // the prepare, which can already create the I/O unit's IOProc on it;
-        // a built-in output is not read.
-        if PublisherOutputPolicy.needsReadBeforeStart(output.info) {
-            let current = halCalls.transportInfo(for: output.deviceID)
-            guard PublisherOutputPolicy.isStillEligibleBeforeStart(deviceID: output.deviceID, current: current) else {
-                HALLifecycleLog.record(
-                    .processedMicrophonePublisherEngine,
-                    .refuse,
-                    id: output.deviceID,
-                    transport: AudioDeviceTransportInfo.logDescription(current),
-                    generation: generation
-                )
-                // Nothing was prepared or started, so nothing is left to stop.
-                // The owner arms the window and tries again after it.
-                throw ProcessedMicrophoneEngineError.outputUnavailable(output.deviceID)
-            }
-        }
-
-        // The reads above block while coreaudiod is busy with a
-        // configuration change, and prepare() can already create the I/O
-        // unit's IOProc on the output.
-        guard mayProceed() else {
-            throw PublisherStartInterrupted(engine: engine, sourceNode: sourceNode, started: false)
-        }
-        try prepareEngine(
-            .processedMicrophonePublisherEngine,
-            step: operation,
-            readingBoundDevice: { engine.boundOutputDeviceID },
-            expected: expected,
-            generation: generation
-        ) {
-            engine.prepare()
-        }
-
-        guard mayProceed() else {
-            throw PublisherStartInterrupted(engine: engine, sourceNode: sourceNode, started: false)
-        }
-        recordEngine(
-            .processedMicrophonePublisherEngine,
-            .startBegin,
-            publisher: engine,
-            expected: expected,
-            generation: generation
-        )
-        var startError: Error?
-        let startFailure: Error?
-        progress.startIssued = true
-        do {
-            try Self.catchingEngineException(operation) {
-                do {
-                    try engine.start()
-                } catch {
-                    startError = error
-                }
-            }
-            startFailure = startError.map {
-                ProcessedMicrophoneEngineError.operationFailed(operation, Self.errorDetail($0)) as Error
-            }
-        } catch {
-            startFailure = error
-        }
-        recordEngine(
-            .processedMicrophonePublisherEngine,
-            .start,
-            publisher: engine,
-            expected: expected,
-            status: Self.startStatus(error: startError, failure: startFailure),
-            generation: generation
-        )
-        if let startFailure {
-            if case ProcessedMicrophoneEngineError.engineRaised = startFailure {
-                // A start that raised is kept, not stopped: see
-                // `makePublisher`.
-                throw startFailure
-            }
-            // A start that failed inside a window armed since it was issued
-            // is not stopped inside it either.
-            guard mayProceed() else {
-                throw PublisherStartInterrupted(engine: engine, sourceNode: sourceNode, started: true)
-            }
-            recordEngine(
-                .processedMicrophonePublisherEngine,
-                .stopBegin,
-                publisher: engine,
-                expected: expected,
-                generation: generation
-            )
-            let stopped = (try? catchingObjCException { engine.stop() }) != nil
-            recordEngine(
-                .processedMicrophonePublisherEngine,
-                .stop,
-                publisher: engine,
-                expected: expected,
-                status: stopped ? noErr : kAudioHardwareUnspecifiedError,
-                generation: generation
-            )
-            throw startFailure
-        }
-        return (engine, sourceNode)
-    }
 
     /// Runs an engine's `prepare()` between its `prepare-begin` and `prepare`
     /// lines. `prepare()` allocates the I/O unit's resources, and can create
@@ -1918,28 +1744,6 @@ final class ProcessedMicrophoneEngine {
         )
     }
 
-    /// The same for the publisher engine, which reads the output it is bound
-    /// to.
-    private func recordEngine(
-        _ object: HALLifecycleLog.Object,
-        _ operation: HALLifecycleLog.Operation,
-        publisher: any ProcessedMicrophonePublisherEngine,
-        expected: (deviceID: AudioDeviceID, transport: String)?,
-        status: OSStatus = noErr,
-        generation: UInt64?,
-        reason: String? = nil
-    ) {
-        recordEngine(
-            object,
-            operation,
-            readingBoundDevice: { publisher.boundOutputDeviceID },
-            expected: expected,
-            status: status,
-            generation: generation,
-            reason: reason
-        )
-    }
-
     /// - Parameter readingBoundOutput: For Apple voice processing, the device
     ///   its unit's output element is bound to, written as `output=`.
     private func recordEngine(
@@ -2011,151 +1815,105 @@ final class ProcessedMicrophoneEngine {
     }
 
     /// Stops what a failed Apple voice processing start got as far as
-    /// building, with a stop line for each engine whose start was issued. A
-    /// stop that raises is dropped: the engines are released either way.
-    ///
-    /// The caller has compared the generation before the capture engine's
-    /// stop. That stop can wait in coreaudiod while a device change begins,
-    /// so the generation is compared again before the publisher's: when a
-    /// window has armed meanwhile, the publisher is not stopped. It is kept,
-    /// rendering silence into the muted tap, with an `interrupt` line, and a
-    /// restart is asked for, so the owner stops it after the window.
+    /// building, with stop lines when the engine's start was issued, and has
+    /// the lifecycle queue release the publisher's IOProc if its start was
+    /// issued. A stop that raises is dropped: the engine is released either
+    /// way. The caller has compared the generation before the engine's stop.
+    /// That stop can wait in coreaudiod while a device change begins, so the
+    /// generation is compared again before the publisher's release is
+    /// issued: when a window has armed meanwhile, the publisher's IOProc is
+    /// kept, rendering silence into the muted tap, with an `interrupt` line,
+    /// and a restart is asked for, so the owner releases it after the window.
+    /// The IOProc's release compares the generation again before each of its
+    /// HAL calls.
     ///
     /// - Returns: False when the publisher was kept that way. The failure is
     ///   then not reported, as for a start a window interrupted.
     private func releaseFailedVoiceProcessingStart(
-        captureEngine: any VoiceProcessingCaptureEngine,
+        _ built: BuiltVoiceProcessingStart,
         generation: UInt64,
-        captureStartAttempted: Bool,
-        input: (deviceID: AudioDeviceID, transport: String),
-        tapInstalled: Bool,
-        ringBuffer: ProcessedMicrophoneRingBuffer?,
-        publisher: (engine: any ProcessedMicrophonePublisherEngine, sourceNode: AVAudioSourceNode)?,
-        publisherOutput: PublisherOutput
+        sessionID: UUID
     ) -> Bool {
+        let captureEngine = built.captureEngine
         // Stopped, not freed, as `stopEngines` does.
         defer {
             retire([captureEngine as AnyObject])
         }
-        if captureStartAttempted {
+        if built.started {
             recordEngine(
                 .processedMicrophoneVoiceProcessingEngine,
                 .stopBegin,
                 engine: captureEngine,
-                expected: input,
+                expected: built.input,
                 generation: generation
             )
         }
         let captureStopped = (try? catchingObjCException { captureEngine.stop() }) != nil
-        if captureStartAttempted {
+        if built.started {
             recordEngine(
                 .processedMicrophoneVoiceProcessingEngine,
                 .stop,
                 engine: captureEngine,
-                expected: input,
+                expected: built.input,
                 status: captureStopped ? noErr : kAudioHardwareUnspecifiedError,
                 generation: generation
             )
         }
-        if tapInstalled {
+        if built.tapInstalled {
             _ = try? catchingObjCException { captureEngine.removeTap() }
         }
-        guard let publisher else {
+        isRunning = false
+        guard built.publisherIssued else {
+            boundPublisherOutput = nil
             return true
         }
-        let expected = (deviceID: publisherOutput.deviceID, transport: publisherOutput.transport)
         guard holdGeneration.isCurrent(generation) else {
-            recordEngine(
-                .processedMicrophonePublisherEngine,
+            HALLifecycleLog.record(
+                .processedMicrophonePublisherIOProc,
                 .interrupt,
-                publisher: publisher.engine,
-                expected: expected,
+                id: built.publisherOutput.deviceID,
+                transport: built.publisherOutput.transport,
                 generation: generation
             )
-            publisherEngine = publisher.engine
-            publisherSourceNode = publisher.sourceNode
-            publisherEngineStarted = true
-            boundPublisherOutput = publisherOutput
-            self.ringBuffer = ringBuffer
+            deviceCapture.closePublisherGate()
+            boundPublisherOutput = built.publisherOutput
+            ringBuffer = built.ringBuffer
             isRunning = true
             requestRestart(.startInterrupted)
             return false
         }
-        recordEngine(
-            .processedMicrophonePublisherEngine,
-            .stopBegin,
-            publisher: publisher.engine,
-            expected: expected,
-            generation: generation
-        )
-        let publisherStopped = (try? catchingObjCException { publisher.engine.stop() }) != nil
-        recordEngine(
-            .processedMicrophonePublisherEngine,
-            .stop,
-            publisher: publisher.engine,
-            expected: expected,
-            status: publisherStopped ? noErr : kAudioHardwareUnspecifiedError,
-            generation: generation
-        )
-        retire([publisher.engine as AnyObject, publisher.sourceNode])
+        boundPublisherOutput = nil
+        releaseIOProcs(session: sessionID, holdToken: generation)
         return true
     }
 
     /// Observes a configuration change of the voice-processing capture
-    /// engine, if there is one, and of the publisher engine, in that order.
-    private func installConfigurationObservers(
-        voiceProcessingEngine: (any VoiceProcessingCaptureEngine)?,
-        publisher: any ProcessedMicrophonePublisherEngine
-    ) {
-        var observers: [NSObjectProtocol] = []
-        if let voiceProcessingEngine {
-            observers.append(
-                NotificationCenter.default.addObserver(
-                    forName: .AVAudioEngineConfigurationChange,
-                    object: voiceProcessingEngine.notificationObject,
-                    queue: .main
-                ) { [weak self, weak engine = voiceProcessingEngine] _ in
-                    guard let self else {
-                        return
-                    }
-                    if let engine {
-                        // The framework has stopped this engine, and may
-                        // already have moved it; the line shows the device it
-                        // is bound to.
-                        recordEngine(
-                            .processedMicrophoneVoiceProcessingEngine,
-                            .invalidate,
-                            engine: engine,
-                            expected: voiceProcessingInput,
-                            generation: holdGeneration.current
-                        )
-                    }
-                    requestRestart(.configurationChanged)
-                }
-            )
-        }
-        observers.append(
+    /// engine.
+    private func installConfigurationObservers(voiceProcessingEngine: any VoiceProcessingCaptureEngine) {
+        configurationObservers = [
             NotificationCenter.default.addObserver(
                 forName: .AVAudioEngineConfigurationChange,
-                object: publisher.notificationObject,
+                object: voiceProcessingEngine.notificationObject,
                 queue: .main
-            ) { [weak self, weak publisher] _ in
+            ) { [weak self, weak engine = voiceProcessingEngine] _ in
                 guard let self else {
                     return
                 }
-                if let publisher {
+                if let engine {
+                    // The framework has stopped this engine, and may already
+                    // have moved it; the line shows the device it is bound
+                    // to.
                     recordEngine(
-                        .processedMicrophonePublisherEngine,
+                        .processedMicrophoneVoiceProcessingEngine,
                         .invalidate,
-                        publisher: publisher,
-                        expected: boundPublisherOutput.map { (deviceID: $0.deviceID, transport: $0.transport) },
+                        engine: engine,
+                        expected: voiceProcessingInput,
                         generation: holdGeneration.current
                     )
                 }
                 requestRestart(.configurationChanged)
             }
-        )
-        configurationObservers = observers
+        ]
     }
 
     private func startLevelTimer(
@@ -2274,73 +2032,6 @@ final class ProcessedMicrophoneEngine {
 
     private static func sanitizedGain(_ decibels: Float) -> Float {
         DigitalGain.clampedDecibels(decibels)
-    }
-}
-
-/// The `AVAudioEngine` calls the publisher makes, so that a test can build a
-/// publisher without opening an output device. `AVAudioPublisherEngine` is
-/// the production conformance; each requirement is the one call it names,
-/// and the caller wraps every one in `catchingObjCException`.
-protocol ProcessedMicrophonePublisherEngine: AnyObject {
-    /// `outputNode`, which instantiates the engine's output unit.
-    func loadOutputNode()
-    /// `outputNode.auAudioUnit.setDeviceID(_:)`.
-    func bindOutput(to deviceID: AudioDeviceID) throws
-    /// `outputNode.auAudioUnit.deviceID`.
-    var boundOutputDeviceID: AudioDeviceID { get }
-    /// `outputNode.outputFormat(forBus: 0)`.
-    func outputFormat() -> AVAudioFormat
-    /// `attach(_:)`, then `connect(_:to: mainMixerNode, format:)`.
-    func attachAndConnect(_ sourceNode: AVAudioSourceNode, format: AVAudioFormat)
-    /// `prepare()`.
-    func prepare()
-    /// `start()`.
-    func start() throws
-    /// `stop()`.
-    func stop()
-    /// The object `AVAudioEngineConfigurationChange` is posted for.
-    var notificationObject: AnyObject { get }
-}
-
-/// The publisher engine the app runs.
-final class AVAudioPublisherEngine: ProcessedMicrophonePublisherEngine {
-    private let engine = AVAudioEngine()
-
-    func loadOutputNode() {
-        _ = engine.outputNode
-    }
-
-    func bindOutput(to deviceID: AudioDeviceID) throws {
-        try engine.outputNode.auAudioUnit.setDeviceID(deviceID)
-    }
-
-    var boundOutputDeviceID: AudioDeviceID {
-        engine.outputNode.auAudioUnit.deviceID
-    }
-
-    func outputFormat() -> AVAudioFormat {
-        engine.outputNode.outputFormat(forBus: 0)
-    }
-
-    func attachAndConnect(_ sourceNode: AVAudioSourceNode, format: AVAudioFormat) {
-        engine.attach(sourceNode)
-        engine.connect(sourceNode, to: engine.mainMixerNode, format: format)
-    }
-
-    func prepare() {
-        engine.prepare()
-    }
-
-    func start() throws {
-        try engine.start()
-    }
-
-    func stop() {
-        engine.stop()
-    }
-
-    var notificationObject: AnyObject {
-        engine
     }
 }
 
@@ -2511,7 +2202,7 @@ final class AVAudioVoiceProcessingEngine: VoiceProcessingCaptureEngine {
     }
 }
 
-/// The output device the publisher engine is bound to.
+/// The output device the publisher is bound to.
 struct PublisherOutput {
     let deviceID: AudioDeviceID
     /// Its transport class, for the log.
@@ -2521,7 +2212,7 @@ struct PublisherOutput {
     let info: AudioDeviceTransportInfo
 }
 
-/// The publisher engine's output, chosen from the output devices and the
+/// The publisher's output, chosen from the output devices and the
 /// default output read uncached immediately before the engine is built.
 enum PublisherOutputReading {
     case bound(PublisherOutput)
@@ -2569,23 +2260,25 @@ enum PublisherOutputReading {
     }
 }
 
-/// The HAL side of the IOProc capture: one input device, one IOProc, and the
-/// listeners that invalidate it.
+/// The HAL side of the processed microphone's IOProcs: the capture, one
+/// IOProc on one input device, for processing off and WebRTC; the publisher,
+/// one IOProc on the output device it is bound to, in every mode; and the
+/// listeners that invalidate either.
 ///
 /// Everything that touches the HAL runs on `queue`: the uncached transport
-/// re-read of the exact device, the format and buffer-size reads, and
-/// creating, starting, stopping and destroying the IOProc and its listeners.
-/// `AudioDeviceStart` can wait in coreaudiod for an unbounded time, and a wait
-/// there costs this queue and nothing else. The listeners never call a HAL
-/// lifecycle function; they close the capture's gate and tell the owner,
-/// which decides a restart.
+/// re-reads of the exact devices, the format and buffer-size reads, and
+/// creating, starting, stopping and destroying the IOProcs and their
+/// listeners. `AudioDeviceStart` can wait in coreaudiod for an unbounded
+/// time, and a wait there costs this queue and nothing else. The listeners
+/// never call a HAL lifecycle function; they close the IOProc's gate and tell
+/// the owner, which decides a restart.
 final class ProcessedMicrophoneDeviceCapture {
     struct Prepared {
         let monoFormat: AVAudioFormat
         let ringBuffer: ProcessedMicrophoneRingBuffer
         let tapContext: ProcessedMicrophoneTapContext
-        /// The output the publisher engine is to be bound to, read in the
-        /// same turn as the input.
+        /// The output the publisher is to be bound to, read in the same turn
+        /// as the input.
         let publisherOutput: PublisherOutput
     }
 
@@ -2613,30 +2306,79 @@ final class ProcessedMicrophoneDeviceCapture {
         case interrupted
     }
 
-    /// The scratch storage the IOProc copies channel 0 into holds at least
-    /// this many frames, and at most `maximumScratchFrames`, whatever the
-    /// device reports as its largest IO buffer. A larger buffer is truncated
-    /// rather than written past the storage.
+    enum PublisherStartOutcome {
+        case started
+        /// The bound output, this ID, read no usable format, or no longer
+        /// qualified when read again immediately before the create or the
+        /// start: a change the HAL is still settling. Whatever the publisher
+        /// had created was released before reporting.
+        case outputUnavailable(AudioDeviceID)
+        /// Its IOProc could not be created or started, and was released
+        /// before reporting.
+        case failed(ProcessedMicrophoneEngineError)
+        /// A quiet window armed after the start was issued. What the
+        /// publisher created stays, not started, until the engine releases it
+        /// after the window.
+        case interrupted
+    }
+
+    /// Which of the two IOProcs a resource is.
+    private enum Role: Hashable {
+        case capture
+        case publisher
+
+        var object: HALLifecycleLog.Object {
+            switch self {
+            case .capture:
+                return .processedMicrophoneCaptureIOProc
+            case .publisher:
+                return .processedMicrophonePublisherIOProc
+            }
+        }
+
+        var listenerObject: HALLifecycleLog.Object {
+            switch self {
+            case .capture:
+                return .processedMicrophoneCaptureListener
+            case .publisher:
+                return .processedMicrophonePublisherListener
+            }
+        }
+
+        /// What invalidates the IOProc: its device dying, or its rate or the
+        /// streams it reads or writes changing.
+        var invalidatingProperties: [AudioObjectPropertyAddress] {
+            [
+                AudioObjectPropertyAddress(
+                    mSelector: kAudioDevicePropertyDeviceIsAlive,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                ),
+                AudioObjectPropertyAddress(
+                    mSelector: kAudioDevicePropertyNominalSampleRate,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                ),
+                AudioObjectPropertyAddress(
+                    mSelector: kAudioDevicePropertyStreamConfiguration,
+                    mScope: self == .capture ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+            ]
+        }
+    }
+
+    /// The order a release takes: the capture, which writes the ring, before
+    /// the publisher, which reads it. A start goes the other way.
+    private static let releaseOrder: [Role] = [.capture, .publisher]
+
+    /// The scratch storage the IOProcs copy into or render from holds at
+    /// least this many frames, and at most `maximumScratchFrames`, whatever
+    /// the device reports as its largest IO buffer. A larger buffer is
+    /// truncated, or rendered silent beyond it, rather than written past the
+    /// storage.
     private static let minimumScratchFrames = 4_096
     private static let maximumScratchFrames = 65_536
-
-    private static let invalidatingProperties: [AudioObjectPropertyAddress] = [
-        AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceIsAlive,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        ),
-        AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        ),
-        AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyStreamConfiguration,
-            mScope: kAudioDevicePropertyScopeInput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-    ]
 
     let queue = DispatchQueue(
         label: "io.github.yuhkis.audio-level-bar.processed-microphone.capture.lifecycle",
@@ -2650,13 +2392,18 @@ final class ProcessedMicrophoneDeviceCapture {
     private let holdGeneration: LifecycleHoldGeneration
     private let sessionLock = NSLock()
     private var session = UUID()
-    /// Guarded by `sessionLock`. The context of the IOProc last created,
-    /// reachable from the main thread at Quit. Internal so a test can watch
-    /// when it is released.
+    /// Guarded by `sessionLock`. The context of the capture IOProc last
+    /// created, reachable from the main thread at Quit. Internal so a test
+    /// can watch when it is released.
     private(set) weak var liveContext: ProcessedMicrophoneCaptureContext?
+    /// Guarded by `sessionLock`. The context of the publisher IOProc last
+    /// created, whose gate the main thread closes before the muted tap is
+    /// withdrawn. Internal so a test can watch when it is released.
+    private(set) weak var livePublisherContext: ProcessedMicrophonePublisherContext?
 
     /// What one session created on one device.
     private struct Resources {
+        let role: Role
         let session: UUID
         let deviceID: AudioDeviceID
         /// The transport class as last read, for the log lines.
@@ -2668,7 +2415,7 @@ final class ProcessedMicrophoneDeviceCapture {
         /// Read by the IOProc block without being retained, so it has to
         /// outlive the IOProc: it is released on `queue` a moment after
         /// `AudioDeviceDestroyIOProcID` has returned.
-        let context: ProcessedMicrophoneCaptureContext
+        let context: any ProcessedMicrophoneGatedContext
         let ioProcID: AudioDeviceIOProcID
         var listenerBlock: AudioObjectPropertyListenerBlock?
         var listenedProperties: [AudioObjectPropertyAddress] = []
@@ -2679,17 +2426,17 @@ final class ProcessedMicrophoneDeviceCapture {
     private enum Release: Equatable {
         case released
         /// A quiet window armed after the release was issued. What it had
-        /// not yet stopped or destroyed stays in `resources`.
+        /// not yet stopped or destroyed stays in `held`.
         case interrupted
     }
 
-    /// How long the context outlives `AudioDeviceDestroyIOProcID`, so that an
+    /// How long a context outlives `AudioDeviceDestroyIOProcID`, so that an
     /// IO cycle still finishing on the HAL IO thread never reads freed
     /// memory, whatever status the destroy returned.
     static let contextReleaseDelay: TimeInterval = 0.5
 
     /// Queue-confined.
-    private var resources: Resources?
+    private var held: [Role: Resources] = [:]
 
     init(halCalls: any HALLifecycleCalls, holdGeneration: LifecycleHoldGeneration) {
         self.halCalls = halCalls
@@ -2703,74 +2450,93 @@ final class ProcessedMicrophoneDeviceCapture {
         sessionLock.unlock()
     }
 
-    /// Main thread. Ends the current session and releases its IOProc on the
-    /// lifecycle queue. A start already queued behind this cannot bring it
+    /// Main thread. Ends the current session and releases its IOProcs on the
+    /// lifecycle queue. A start already queued behind this cannot bring them
     /// back up.
+    ///
+    /// The publisher's gate is closed here, synchronously, before anything
+    /// is queued: from its next IO cycle on it renders silence, so the owner
+    /// may withdraw the muted tap without waiting for the queue.
     ///
     /// Like a start, the release takes the quiet window's generation when it
     /// is issued and compares it immediately before each HAL call. If a
     /// window armed before a call, what is not yet stopped or destroyed
-    /// stays, its gate closed so nothing more reaches the processing path,
-    /// and `onInterrupted` runs on the queue so the engine can have it
-    /// released after the window. A newer start or release takes over.
+    /// stays, its gate closed so nothing more reaches the processing path or
+    /// the output, and `onInterrupted` runs on the queue so the engine can
+    /// have it released after the window. A newer start or release takes
+    /// over.
     func release(
         session releaseSession: UUID,
         holdToken: UInt64,
         onInterrupted: @escaping () -> Void
     ) {
         begin(session: releaseSession)
+        closePublisherGate()
         queue.async { [self] in
-            guard isCurrent(releaseSession), resources != nil else {
+            guard isCurrent(releaseSession), !held.isEmpty else {
                 return
             }
-            if stopResources(holdToken: holdToken) == .interrupted {
+            if stopAll(holdToken: holdToken) == .interrupted {
                 onInterrupted()
             }
         }
     }
 
-    /// Main thread. coreaudiod restarted: the IOProc and its listeners went
-    /// with the old server. Ends the session and drops them on the lifecycle
-    /// queue without a HAL call. The context the IOProc block read is kept
-    /// for the life of the process, because nothing confirmed that the IO
-    /// thread has let go of it.
+    /// Main thread. Has the publisher IOProc last created render silence from
+    /// its next IO cycle on.
+    func closePublisherGate() {
+        sessionLock.lock()
+        let context = livePublisherContext
+        sessionLock.unlock()
+        context?.close()
+    }
+
+    /// Main thread. coreaudiod restarted: the IOProcs and their listeners
+    /// went with the old server. Ends the session and drops them on the
+    /// lifecycle queue without a HAL call. The contexts the IOProc blocks
+    /// read are kept for the life of the process, because nothing confirmed
+    /// that the IO thread has let go of them.
     func forgetAfterServiceRestart() {
         begin(session: UUID())
         queue.async { [self] in
-            guard let current = resources else {
-                return
+            for role in Self.releaseOrder {
+                guard let current = held[role] else {
+                    continue
+                }
+                held[role] = nil
+                current.context.close()
+                _ = Unmanaged.passRetained(current.context as AnyObject)
+                HALLifecycleLog.record(
+                    role.object,
+                    .forget,
+                    id: current.deviceID,
+                    transport: current.transport,
+                    generation: holdGeneration.current
+                )
             }
-            resources = nil
-            current.context.close()
-            _ = Unmanaged.passRetained(current.context)
-            HALLifecycleLog.record(
-                .processedMicrophoneCaptureIOProc,
-                .forget,
-                id: current.deviceID,
-                transport: current.transport,
-                generation: holdGeneration.current
-            )
         }
     }
 
     /// The label of the capture's release in Quit's `LifecycleStopGroup`.
     static let quitStopLabel = "processed-capture"
 
-    /// Main thread, Quit only. Closes the current context's gate.
+    /// Main thread, Quit only. Closes the current contexts' gates.
     func closeGateAtQuit() {
         sessionLock.lock()
         let context = liveContext
+        let publisherContext = livePublisherContext
         sessionLock.unlock()
         context?.close()
+        publisherContext?.close()
     }
 
-    /// Main thread, Quit only. Releases the IOProc on the lifecycle queue,
+    /// Main thread, Quit only. Releases the IOProcs on the lifecycle queue,
     /// whatever the quiet window, counted in `stops`, reporting progress
     /// before each HAL call.
     func releaseAtQuit(in stops: LifecycleStopGroup) {
         begin(session: UUID())
         stops.run(label: Self.quitStopLabel, on: queue) { [self] progress in
-            stopResources(holdToken: nil, reason: HALLifecycleLog.quitReason, progress: progress)
+            stopAll(holdToken: nil, reason: HALLifecycleLog.quitReason, progress: progress)
         }
     }
 
@@ -2780,9 +2546,9 @@ final class ProcessedMicrophoneDeviceCapture {
         return session == candidate
     }
 
-    /// Runs only on `queue`. Creates the IOProc and its listeners without
-    /// starting it. nil when the session was superseded, with anything it
-    /// built already released.
+    /// Runs only on `queue`. Creates the capture IOProc and its listeners
+    /// without starting it. nil when the session was superseded, with
+    /// anything it built already released.
     func prepare(
         deviceID: AudioDeviceID,
         session: UUID,
@@ -2805,7 +2571,7 @@ final class ProcessedMicrophoneDeviceCapture {
             return .interrupted
         }
         guard
-            stopResources(holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
+            stopAll(holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
         else {
             return .interrupted
         }
@@ -2837,16 +2603,16 @@ final class ProcessedMicrophoneDeviceCapture {
             }
         }
 
-        // The output the publisher engine will be bound to, read uncached in
-        // the same turn and before anything is created: without an output it
-        // may render to, nothing is.
+        // The output the publisher will be bound to, read uncached in the
+        // same turn and before anything is created: without an output it may
+        // render to, nothing is.
         let publisherOutput: PublisherOutput
         switch PublisherOutputReading.read(halCalls) {
         case let .bound(output):
             publisherOutput = output
         case let .refused(refusal, defaultOutputID, defaultTransport):
             HALLifecycleLog.record(
-                .processedMicrophonePublisherEngine,
+                .processedMicrophonePublisherIOProc,
                 .refuse,
                 id: defaultOutputID,
                 transport: defaultTransport,
@@ -2866,13 +2632,7 @@ final class ProcessedMicrophoneDeviceCapture {
         else {
             return .failed(.unsupportedInputFormat)
         }
-        let scratchFrames = min(
-            max(
-                halCalls.maximumBufferFrameSize(for: deviceID) ?? 0,
-                Self.minimumScratchFrames
-            ),
-            Self.maximumScratchFrames
-        )
+        let scratchFrames = Self.scratchFrames(for: deviceID, halCalls: halCalls)
 
         // An IOProc delivers one device buffer per call, far shorter than the
         // ring, which holds several of them.
@@ -2956,7 +2716,8 @@ final class ProcessedMicrophoneDeviceCapture {
                 )
             )
         }
-        resources = Resources(
+        held[.capture] = Resources(
+            role: .capture,
             session: session,
             deviceID: deviceID,
             transport: transport,
@@ -2968,14 +2729,13 @@ final class ProcessedMicrophoneDeviceCapture {
         sessionLock.unlock()
         let watchesSubDeviceLists = AggregateMembershipPolicy.watchesSubDeviceLists(info)
         addListeners(
-            deviceID: deviceID,
-            properties: Self.invalidatingProperties + (watchesSubDeviceLists ? SubDeviceListProperty.addresses : []),
-            transport: transport,
-            context: context,
+            .capture,
+            properties: Role.capture.invalidatingProperties
+                + (watchesSubDeviceLists ? SubDeviceListProperty.addresses : []),
             holdToken: holdToken,
             onInvalidated: onInvalidated
         )
-        resources?.watchesSubDeviceLists = watchesSubDeviceLists
+        held[.capture]?.watchesSubDeviceLists = watchesSubDeviceLists
 
         guard isCurrent(session) else {
             // The newer start or release is queued behind this one and
@@ -2992,26 +2752,251 @@ final class ProcessedMicrophoneDeviceCapture {
         )
     }
 
-    /// Runs only on `queue`. Starts the IOProc `prepare` created for this
-    /// session. nil when the session was superseded; an IOProc that started
-    /// meanwhile is released rather than left running.
+    /// Runs only on `queue`. Creates the publisher's IOProc on `output` and
+    /// starts it, rendering `ringBuffer`, whose sample rate is
+    /// `inputSampleRate`, into that device, muted by the public tap. nil when
+    /// the session was superseded.
+    ///
+    /// The same sequence as the capture's, with the publisher's policy: an
+    /// output that is not built-in is read again, uncached, immediately
+    /// before the IOProc is created, and again once its listeners are in
+    /// place, immediately before `AudioDeviceStart`, and the publisher stops
+    /// there unless it still qualifies (`PublisherOutputPolicy`). A built-in
+    /// output never becomes Bluetooth and is not read again. Nothing here
+    /// follows the default output: the IOProc is on this one device until it
+    /// is destroyed, and no default-device aggregate is made for it.
+    ///
+    /// Only what this session created is released here. What an earlier
+    /// session left in the publisher's place is released first, like a
+    /// capture's leftovers in `prepare`; in processing off and WebRTC that
+    /// release has already run there.
+    func startPublisher(
+        output: PublisherOutput,
+        ringBuffer: ProcessedMicrophoneRingBuffer,
+        inputSampleRate: Double,
+        session: UUID,
+        holdToken: UInt64,
+        onInvalidated: @escaping () -> Void
+    ) -> PublisherStartOutcome? {
+        let deviceID = output.deviceID
+        guard isCurrent(session) else {
+            return nil
+        }
+        guard holdGeneration.isCurrent(holdToken) else {
+            HALLifecycleLog.record(
+                .processedMicrophonePublisherIOProc,
+                .interrupt,
+                id: deviceID,
+                transport: output.transport,
+                generation: holdToken
+            )
+            return .interrupted
+        }
+        guard
+            stopResources(.publisher, holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
+        else {
+            return .interrupted
+        }
+
+        var transport = output.transport
+        if PublisherOutputPolicy.needsReadBeforeStart(output.info) {
+            let current = halCalls.transportInfo(for: deviceID)
+            transport = AudioDeviceTransportInfo.logDescription(current)
+            guard PublisherOutputPolicy.isStillEligibleBeforeStart(deviceID: deviceID, current: current) else {
+                HALLifecycleLog.record(
+                    .processedMicrophonePublisherIOProc,
+                    .refuse,
+                    id: deviceID,
+                    transport: transport,
+                    generation: holdToken
+                )
+                return .outputUnavailable(deviceID)
+            }
+        }
+
+        // A device being reconfigured or removed reads no format, or 0 Hz.
+        guard
+            let format = halCalls.outputStreamFormat(for: deviceID),
+            format.sampleFormat == .float32,
+            format.channelCount > 0,
+            let context = ProcessedMicrophonePublisherContext(
+                ringBuffer: ringBuffer,
+                inputSampleRate: inputSampleRate,
+                outputSampleRate: format.sampleRate,
+                maximumFrames: Self.scratchFrames(for: deviceID, halCalls: halCalls)
+            )
+        else {
+            return .outputUnavailable(deviceID)
+        }
+        guard isCurrent(session) else {
+            return nil
+        }
+        guard holdGeneration.isCurrent(holdToken) else {
+            HALLifecycleLog.record(
+                .processedMicrophonePublisherIOProc,
+                .interrupt,
+                id: deviceID,
+                transport: transport,
+                generation: holdToken
+            )
+            return .interrupted
+        }
+
+        HALLifecycleLog.begin(
+            .processedMicrophonePublisherIOProc,
+            .create,
+            id: deviceID,
+            transport: transport,
+            generation: holdToken
+        )
+        // A nil queue runs the block on the HAL IO thread. It reads the ring
+        // into storage allocated above, resampling with a converter made
+        // above when the rates differ, with no allocation, lock or dispatch,
+        // and without retaining the context.
+        let (createStatus, newIOProcID) = halCalls.createIOProc(
+            deviceID: deviceID,
+            queue: nil
+        ) { [unowned(unsafe) context] _, _, _, outputData, _ in
+            context.render(outputData)
+        }
+        HALLifecycleLog.record(
+            .processedMicrophonePublisherIOProc,
+            .create,
+            id: deviceID,
+            transport: transport,
+            status: createStatus,
+            generation: holdToken
+        )
+        guard createStatus == noErr, let newIOProcID else {
+            let status = createStatus == noErr ? kAudioHardwareUnspecifiedError : createStatus
+            return .failed(
+                .operationFailed(
+                    localized("Starting processed microphone output"),
+                    "Core Audio status \(status)"
+                )
+            )
+        }
+        held[.publisher] = Resources(
+            role: .publisher,
+            session: session,
+            deviceID: deviceID,
+            transport: transport,
+            context: context,
+            ioProcID: newIOProcID
+        )
+        sessionLock.lock()
+        livePublisherContext = context
+        sessionLock.unlock()
+        let watchesSubDeviceLists = output.info.transport == .aggregate
+        addListeners(
+            .publisher,
+            properties: Role.publisher.invalidatingProperties
+                + (watchesSubDeviceLists ? SubDeviceListProperty.addresses : []),
+            holdToken: holdToken,
+            onInvalidated: onInvalidated
+        )
+        held[.publisher]?.watchesSubDeviceLists = watchesSubDeviceLists
+
+        // Read again with the listeners in place, immediately before the
+        // start: an aggregate output can gain a Bluetooth member while its ID
+        // stays, and a change after this read reaches a listener.
+        if PublisherOutputPolicy.needsReadBeforeStart(output.info) {
+            let current = halCalls.transportInfo(for: deviceID)
+            transport = AudioDeviceTransportInfo.logDescription(current)
+            held[.publisher]?.transport = transport
+            guard PublisherOutputPolicy.isStillEligibleBeforeStart(deviceID: deviceID, current: current) else {
+                HALLifecycleLog.record(
+                    .processedMicrophonePublisherIOProc,
+                    .refuse,
+                    id: deviceID,
+                    transport: transport,
+                    generation: holdToken
+                )
+                guard isCurrent(session) else {
+                    return nil
+                }
+                // If a window armed since the read, the IOProc, never
+                // started, is destroyed only after the window.
+                guard
+                    stopResources(.publisher, holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
+                else {
+                    return .interrupted
+                }
+                return .outputUnavailable(deviceID)
+            }
+        }
+        guard isCurrent(session) else {
+            return nil
+        }
+        guard holdGeneration.isCurrent(holdToken) else {
+            HALLifecycleLog.record(
+                .processedMicrophonePublisherIOProc,
+                .interrupt,
+                id: deviceID,
+                transport: transport,
+                generation: holdToken
+            )
+            return .interrupted
+        }
+
+        held[.publisher]?.ioProc = .startUnconfirmed
+        HALLifecycleLog.begin(
+            .processedMicrophonePublisherIOProc,
+            .start,
+            id: deviceID,
+            transport: transport,
+            generation: holdToken
+        )
+        let status = halCalls.start(deviceID: deviceID, ioProcID: newIOProcID)
+        HALLifecycleLog.record(
+            .processedMicrophonePublisherIOProc,
+            .start,
+            id: deviceID,
+            transport: transport,
+            status: status,
+            generation: holdToken
+        )
+        guard status == noErr else {
+            guard
+                stopResources(.publisher, holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
+            else {
+                return .interrupted
+            }
+            return .failed(
+                .operationFailed(
+                    localized("Starting processed microphone output"),
+                    "Core Audio status \(status)"
+                )
+            )
+        }
+        held[.publisher]?.ioProc = .started
+        guard isCurrent(session) else {
+            // A stop or another start landed while this one was starting. It
+            // is queued behind this one and stops what started here.
+            return nil
+        }
+        return .started
+    }
+
+    /// Runs only on `queue`. Starts the capture IOProc `prepare` created for
+    /// this session. nil when the session was superseded; an IOProc that
+    /// started meanwhile is released rather than left running.
     func startIO(session: UUID, holdToken: UInt64) -> StartOutcome? {
         guard
             isCurrent(session),
-            let current = resources,
+            let current = held[.capture],
             current.session == session
         else {
             return nil
         }
 
         // Read the exact device again immediately before starting it, with
-        // its listeners in place since `prepare`. The publisher start on the
-        // main thread came in between, and an aggregate's sub-devices can
-        // change while its ID stays; a change after this read reaches a
-        // listener.
+        // its listeners in place since `prepare`. The publisher's start came
+        // in between, and an aggregate's sub-devices can change while its ID
+        // stays; a change after this read reaches a listener.
         let info = halCalls.transportInfo(for: current.deviceID)
         let transport = AudioDeviceTransportInfo.logDescription(info)
-        resources?.transport = transport
+        held[.capture]?.transport = transport
         switch InputOpenSequence.afterListeners(
             deviceID: current.deviceID,
             secondInfo: info,
@@ -3033,7 +3018,7 @@ final class ProcessedMicrophoneDeviceCapture {
             // since the read, the IOProc, never started, is destroyed only
             // after the window, by the owner's restart.
             guard
-                stopResources(holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
+                stopResources(.capture, holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
             else {
                 return .interrupted
             }
@@ -3069,18 +3054,16 @@ final class ProcessedMicrophoneDeviceCapture {
         }
         if !current.watchesSubDeviceLists, AggregateMembershipPolicy.watchesSubDeviceLists(info) {
             addListeners(
-                deviceID: current.deviceID,
+                .capture,
                 properties: SubDeviceListProperty.addresses,
-                transport: transport,
-                context: current.context,
                 holdToken: holdToken,
                 // `prepare` set both; the block already added is reused.
                 onInvalidated: current.onInvalidated ?? {}
             )
-            resources?.watchesSubDeviceLists = true
+            held[.capture]?.watchesSubDeviceLists = true
         }
 
-        resources?.ioProc = .startUnconfirmed
+        held[.capture]?.ioProc = .startUnconfirmed
         HALLifecycleLog.begin(
             .processedMicrophoneCaptureIOProc,
             .start,
@@ -3099,7 +3082,7 @@ final class ProcessedMicrophoneDeviceCapture {
         )
         guard status == noErr else {
             guard
-                stopResources(holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
+                stopResources(.capture, holdToken: holdToken, loggingAnInterruptionAs: .interrupt) == .released
             else {
                 // The start waited long enough for a window to arm. What it
                 // created and has not released yet is released after the
@@ -3108,7 +3091,7 @@ final class ProcessedMicrophoneDeviceCapture {
             }
             return .failed(status)
         }
-        resources?.ioProc = .started
+        held[.capture]?.ioProc = .started
 
         guard isCurrent(session) else {
             // A stop or another start landed while this one was starting. It
@@ -3119,20 +3102,34 @@ final class ProcessedMicrophoneDeviceCapture {
         return .started
     }
 
+    /// The scratch storage for an IOProc on `deviceID`, from the largest IO
+    /// buffer it reports, within the bounds above.
+    private static func scratchFrames(for deviceID: AudioDeviceID, halCalls: any HALLifecycleCalls) -> Int {
+        min(
+            max(
+                halCalls.maximumBufferFrameSize(for: deviceID) ?? 0,
+                minimumScratchFrames
+            ),
+            maximumScratchFrames
+        )
+    }
+
     /// Runs only on `queue`. Adds one listener block for `properties` to
-    /// what the current resources already listen to. A listener that cannot
+    /// what the `role`'s resources already listen to. A listener that cannot
     /// be added is logged and skipped rather than failing the start: the poll
-    /// still notices a default-input change.
+    /// still notices a default-device change.
     private func addListeners(
-        deviceID: AudioDeviceID,
+        _ role: Role,
         properties: [AudioObjectPropertyAddress],
-        transport: String,
-        context: ProcessedMicrophoneCaptureContext,
         holdToken: UInt64,
         onInvalidated: @escaping () -> Void
     ) {
-        resources?.onInvalidated = onInvalidated
-        let listener: AudioObjectPropertyListenerBlock = resources?.listenerBlock ?? { [weak self, context] count, addresses in
+        guard let current = held[role] else {
+            return
+        }
+        held[role]?.onInvalidated = onInvalidated
+        let context = current.context
+        let listener: AudioObjectPropertyListenerBlock = current.listenerBlock ?? { [weak self, context] count, addresses in
             // Only closes the gate, tells the owner, and for an aggregate's
             // active sub-devices asks the lifecycle queue to read the device
             // again. A change of its full composition only invalidates. Never
@@ -3142,14 +3139,14 @@ final class ProcessedMicrophoneDeviceCapture {
                 onInvalidated()
             }
             if activeSubDevicesChanged {
-                self?.recheckAggregateMembership(of: context)
+                self?.recheckAggregateMembership(of: context, role: role)
             }
         }
 
-        var listened = resources?.listenedProperties ?? []
+        var listened = current.listenedProperties
         for property in properties {
             let status = halCalls.addPropertyListener(
-                deviceID: deviceID,
+                deviceID: current.deviceID,
                 address: property,
                 queue: listenerQueue,
                 block: listener
@@ -3158,35 +3155,35 @@ final class ProcessedMicrophoneDeviceCapture {
                 listened.append(property)
             } else {
                 HALLifecycleLog.record(
-                    .processedMicrophoneCaptureListener,
+                    role.listenerObject,
                     .create,
-                    id: deviceID,
-                    transport: transport,
+                    id: current.deviceID,
+                    transport: current.transport,
                     status: status,
                     generation: holdToken
                 )
             }
         }
-        resources?.listenerBlock = listener
-        resources?.listenedProperties = listened
+        held[role]?.listenerBlock = listener
+        held[role]?.listenedProperties = listened
     }
 
-    /// Listener queue. Has the lifecycle queue read the aggregate the IOProc
-    /// captures from again, uncached, after its active sub-devices changed.
+    /// Listener queue. Has the lifecycle queue read the aggregate an IOProc
+    /// runs on again, uncached, after its active sub-devices changed.
     ///
     /// A last resort, and a lifecycle step the quiet window does not hold:
-    /// the capture never opens an aggregate that names a Bluetooth member, so
-    /// this is reached only when the composition is edited while it is open.
-    /// If a Bluetooth device is now active in the aggregate, the IOProc is
-    /// stopped and destroyed at once, because a stop of the app's own IO is
-    /// safer than letting it carry the headset's microphone through the
+    /// neither IOProc is opened on an aggregate that names a Bluetooth
+    /// member, so this is reached only when the composition is edited while
+    /// it is open. If a Bluetooth device is now active in the aggregate, the
+    /// IOProc is stopped and destroyed at once, because a stop of the app's
+    /// own IO is safer than letting it carry the headset through the
     /// headset's configuration change. Nothing is started here; the engine
     /// already has the invalidation, and the owner decides after the window.
     /// The stop is not exempt from the hardware gate's judgement of stops
     /// against the Bluetooth configuration-change requests.
-    private func recheckAggregateMembership(of context: ProcessedMicrophoneCaptureContext) {
+    private func recheckAggregateMembership(of context: any ProcessedMicrophoneGatedContext, role: Role) {
         queue.async { [self] in
-            guard let current = resources, current.context === context else {
+            guard let current = held[role], current.context === context else {
                 // Already released, or replaced by a newer start.
                 return
             }
@@ -3195,18 +3192,42 @@ final class ProcessedMicrophoneDeviceCapture {
                 return
             }
             HALLifecycleLog.record(
-                .processedMicrophoneCaptureIOProc,
+                role.object,
                 .refuse,
                 id: current.deviceID,
                 transport: AudioDeviceTransportInfo.logDescription(info),
                 generation: nil,
                 reason: SubDeviceListProperty.bluetoothJoinedReason
             )
-            stopResources(holdToken: nil, reason: SubDeviceListProperty.bluetoothJoinedReason)
+            stopResources(role, holdToken: nil, reason: SubDeviceListProperty.bluetoothJoinedReason)
         }
     }
 
-    /// Runs only on `queue`. Releases everything the current resources hold,
+    /// Runs only on `queue`. Releases both IOProcs, the capture first, and
+    /// ends at the first release a quiet window holds back.
+    @discardableResult
+    private func stopAll(
+        holdToken: UInt64?,
+        loggingAnInterruptionAs interruption: HALLifecycleLog.Operation = .interruptStop,
+        reason: String? = nil,
+        progress: LifecycleStopGroup.Progress? = nil
+    ) -> Release {
+        for role in Self.releaseOrder {
+            let release = stopResources(
+                role,
+                holdToken: holdToken,
+                loggingAnInterruptionAs: interruption,
+                reason: reason,
+                progress: progress
+            )
+            guard release == .released else {
+                return release
+            }
+        }
+        return .released
+    }
+
+    /// Runs only on `queue`. Releases everything the `role`'s resources hold,
     /// one HAL call at a time, in `LifecycleTeardown`'s order: the listeners,
     /// the stop, then the IOProc. After a start that did not return `noErr`,
     /// whether the device reports the IO running is read first, and running
@@ -3227,12 +3248,13 @@ final class ProcessedMicrophoneDeviceCapture {
     ///   - progress: At Quit, told the phase immediately before each HAL call.
     @discardableResult
     private func stopResources(
+        _ role: Role,
         holdToken: UInt64?,
         loggingAnInterruptionAs interruption: HALLifecycleLog.Operation = .interruptStop,
         reason: String? = nil,
         progress: LifecycleStopGroup.Progress? = nil
     ) -> Release {
-        guard var current = resources else {
+        guard var current = held[role] else {
             return .released
         }
         current.context.close()
@@ -3252,7 +3274,7 @@ final class ProcessedMicrophoneDeviceCapture {
             }
             current.listenerBlock = nil
             current.listenedProperties = []
-            resources = current
+            held[role] = current
         }
 
         var teardown = LifecycleTeardown(ioProc: current.ioProc)
@@ -3270,7 +3292,7 @@ final class ProcessedMicrophoneDeviceCapture {
                     ? reason ?? HALLifecycleLog.unconfirmedStartReason
                     : reason
                 HALLifecycleLog.begin(
-                    .processedMicrophoneCaptureIOProc,
+                    role.object,
                     .stop,
                     id: current.deviceID,
                     transport: current.transport,
@@ -3279,7 +3301,7 @@ final class ProcessedMicrophoneDeviceCapture {
                 )
                 let stopStatus = halCalls.stop(deviceID: current.deviceID, ioProcID: current.ioProcID)
                 HALLifecycleLog.record(
-                    .processedMicrophoneCaptureIOProc,
+                    role.object,
                     .stop,
                     id: current.deviceID,
                     transport: current.transport,
@@ -3290,7 +3312,7 @@ final class ProcessedMicrophoneDeviceCapture {
                 teardown.complete(.stop)
             case .destroyIOProc:
                 HALLifecycleLog.begin(
-                    .processedMicrophoneCaptureIOProc,
+                    role.object,
                     .destroy,
                     id: current.deviceID,
                     transport: current.transport,
@@ -3302,7 +3324,7 @@ final class ProcessedMicrophoneDeviceCapture {
                     ioProcID: current.ioProcID
                 )
                 HALLifecycleLog.record(
-                    .processedMicrophoneCaptureIOProc,
+                    role.object,
                     .destroy,
                     id: current.deviceID,
                     transport: current.transport,
@@ -3313,27 +3335,27 @@ final class ProcessedMicrophoneDeviceCapture {
                 teardown.complete(.destroyIOProc)
                 releaseContext(current.context, afterDestroyReturned: destroyStatus)
             case .destroyAggregate, .destroyProcessTap:
-                // The capture holds neither.
+                // Neither IOProc holds one.
                 teardown.complete(step)
             }
             current.ioProc = teardown.ioProc
-            resources = current
+            held[role] = current
         }
-        resources = nil
+        held[role] = nil
         return .released
     }
 
     /// Runs only on `queue`.
     private func interruptRelease(
-        of held: Resources,
+        of kept: Resources,
         as operation: HALLifecycleLog.Operation,
         holdToken: UInt64?
     ) -> Release {
         HALLifecycleLog.record(
-            .processedMicrophoneCaptureIOProc,
+            kept.role.object,
             operation,
-            id: held.deviceID,
-            transport: held.transport,
+            id: kept.deviceID,
+            transport: kept.transport,
             generation: holdToken
         )
         return .interrupted
@@ -3342,7 +3364,7 @@ final class ProcessedMicrophoneDeviceCapture {
     /// Runs only on `queue`, right after `AudioDeviceDestroyIOProcID`
     /// returned `status`.
     ///
-    /// The IOProc block reads the context without retaining it. Nothing
+    /// An IOProc block reads its context without retaining it. Nothing
     /// documents that the destroy waits for an IO cycle already running on
     /// the HAL IO thread, and a device that vanished answers without having
     /// synchronized with that thread at all. So the context is kept for
@@ -3351,7 +3373,7 @@ final class ProcessedMicrophoneDeviceCapture {
     /// not confirm the IOProc is gone, and the context is kept for the life
     /// of the process.
     private func releaseContext(
-        _ context: ProcessedMicrophoneCaptureContext,
+        _ context: any ProcessedMicrophoneGatedContext,
         afterDestroyReturned status: OSStatus
     ) {
         guard
@@ -3359,7 +3381,7 @@ final class ProcessedMicrophoneDeviceCapture {
                 || status == kAudioHardwareBadDeviceError
                 || status == kAudioHardwareBadObjectError
         else {
-            _ = Unmanaged.passRetained(context)
+            _ = Unmanaged.passRetained(context as AnyObject)
             return
         }
         queue.asyncAfter(deadline: .now() + Self.contextReleaseDelay) {
@@ -3367,6 +3389,17 @@ final class ProcessedMicrophoneDeviceCapture {
         }
     }
 }
+
+/// The context an IOProc block reads, with the gate that stops it passing
+/// anything on.
+protocol ProcessedMicrophoneGatedContext: AnyObject {
+    /// True when this call closed an open gate.
+    @discardableResult
+    func close() -> Bool
+}
+
+extension ProcessedMicrophoneCaptureContext: ProcessedMicrophoneGatedContext {}
+extension ProcessedMicrophonePublisherContext: ProcessedMicrophoneGatedContext {}
 
 /// What the IOProc block reads on the HAL IO thread: the sample format,
 /// preallocated storage for channel 0, and the processing path.
@@ -3682,7 +3715,7 @@ final class ProcessedMicrophoneLevelStore: @unchecked Sendable {
 }
 
 /// A single-producer/single-consumer Float32 PCM ring buffer. The input tap is
-/// the sole producer and the AVAudioSourceNode render block is the sole
+/// the sole producer and the publisher IOProc block is the sole
 /// consumer. Atomic indices keep both real-time callbacks free of locks and
 /// allocations.
 final class ProcessedMicrophoneRingBuffer: @unchecked Sendable {

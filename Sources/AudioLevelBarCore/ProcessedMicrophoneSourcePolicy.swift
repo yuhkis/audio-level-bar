@@ -21,7 +21,7 @@ public enum ProcessedMicrophoneRefusal: Equatable {
     /// headset's own configuration change: an engine that follows the
     /// defaults would move onto it before any quiet window could stop it.
     case bluetoothDevicePresentForVoiceProcessing
-    /// There is no output the publisher engine may be bound to: no built-in
+    /// There is no output the publisher may be bound to: no built-in
     /// output, and no other output known not to involve Bluetooth. The engine
     /// is never bound to a Bluetooth output, nor left to follow the default
     /// output onto one. See `PublisherOutputPolicy`.
@@ -57,9 +57,9 @@ public enum ProcessedMicrophoneSourceDecision: Equatable {
 /// processing does, because its engine follows the default input and output
 /// itself: it does not run while any Bluetooth audio device is connected, or
 /// while whether one is cannot be told. Every mode needs an output the
-/// publisher engine may be bound to, chosen by `PublisherOutputPolicy`.
+/// publisher may be bound to, chosen by `PublisherOutputPolicy`.
 public enum ProcessedMicrophoneSourcePolicy {
-    /// The decision with the publisher engine's output taken into account:
+    /// The decision with the publisher's output taken into account:
     /// the input and, for Apple voice processing, the connected Bluetooth
     /// devices and the default output first, then whether an output the
     /// publisher may be bound to exists.

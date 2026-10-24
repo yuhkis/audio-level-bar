@@ -87,7 +87,10 @@ protocol HALLifecycleCalls {
     func transportInfo(for deviceID: AudioObjectID) -> AudioDeviceTransportInfo?
 
     /// `CoreAudioSystem.inputStreamFormat(for:)`.
-    func inputStreamFormat(for deviceID: AudioObjectID) -> InputStreamFormat?
+    func inputStreamFormat(for deviceID: AudioObjectID) -> DeviceStreamFormat?
+
+    /// `CoreAudioSystem.outputStreamFormat(for:)`.
+    func outputStreamFormat(for deviceID: AudioObjectID) -> DeviceStreamFormat?
 
     /// `CoreAudioSystem.maximumBufferFrameSize(for:)`.
     func maximumBufferFrameSize(for deviceID: AudioObjectID) -> Int?
@@ -240,8 +243,12 @@ struct CoreAudioHALLifecycleCalls: HALLifecycleCalls {
         audioSystem.transportInfo(for: deviceID)
     }
 
-    func inputStreamFormat(for deviceID: AudioObjectID) -> InputStreamFormat? {
+    func inputStreamFormat(for deviceID: AudioObjectID) -> DeviceStreamFormat? {
         audioSystem.inputStreamFormat(for: deviceID)
+    }
+
+    func outputStreamFormat(for deviceID: AudioObjectID) -> DeviceStreamFormat? {
+        audioSystem.outputStreamFormat(for: deviceID)
     }
 
     func maximumBufferFrameSize(for deviceID: AudioObjectID) -> Int? {

@@ -1,6 +1,6 @@
 import Foundation
 
-/// One output device, as the publisher engine's output is chosen from it.
+/// One output device, as the publisher's output is chosen from it.
 public struct PublisherOutputCandidate: Equatable {
     public var deviceID: UInt32
     /// The transport and, for an aggregate, its active sub-devices. nil when
@@ -93,20 +93,21 @@ public enum PublisherOutputRefusal: Equatable {
 }
 
 public enum PublisherOutputChoice: Equatable {
-    /// Bind the publisher engine to this device.
+    /// Bind the publisher to this device.
     case device(UInt32, AudioDeviceTransportInfo)
     case refused(PublisherOutputRefusal)
 }
 
-/// Chooses the output device the processed microphone's publisher engine is
+/// Chooses the output device the processed microphone's publisher is
 /// bound to, and tells when a running one has to be rebuilt.
 ///
 /// The publisher's audio is captured by a muted tap on this process's own
 /// audio, not on a device, so the device it renders to is never heard. What
-/// matters is that the engine never renders through a Bluetooth device and
+/// matters is that the publisher never renders through a Bluetooth device and
 /// never follows the default output: an `AVAudioEngine` left on the default
-/// output moves itself onto an arriving headset and restarts its IO there
-/// while the headset is still reconfiguring. So the engine is bound to:
+/// output, or bound to another device, moves itself onto an arriving headset
+/// and restarts its IO there while the headset is still reconfiguring. So the
+/// publisher is an IOProc on one device, and that device is:
 /// - a built-in output when there is one: the default output if it is
 ///   built-in, otherwise the built-in output with the lowest ID. It never
 ///   becomes Bluetooth and never goes away, so the choice does not move when
@@ -147,7 +148,7 @@ public enum PublisherOutputPolicy {
         return .refused(unread ? .outputsNotRead : .noNonBluetoothOutput)
     }
 
-    /// Whether the publisher engine may be bound to this device: it has
+    /// Whether the publisher may be bound to this device: it has
     /// output channels, and its transport, an aggregate's active sub-devices
     /// and its full composition were read and resolved, are known, and none
     /// of them is Bluetooth. An unknown transport or an aggregate that cannot
@@ -162,7 +163,7 @@ public enum PublisherOutputPolicy {
             == .open(.knownTransport)
     }
 
-    /// Whether a running publisher engine bound to `deviceID` has to be
+    /// Whether a running publisher bound to `deviceID` has to be
     /// rebuilt, from what the poll shows now.
     ///
     /// True only on evidence: the device is no longer listed, it now
@@ -218,8 +219,8 @@ public enum PublisherOutputPolicy {
         return true
     }
 
-    /// Whether the output a publisher engine was bound to has to be read
-    /// again immediately before the engine is prepared and started. A built-in output cannot
+    /// Whether the output a publisher is bound to has to be read again
+    /// immediately before its IOProc is created and started. A built-in output cannot
     /// gain a Bluetooth sub-device, so it is not; any other output, such as
     /// an aggregate default output, can between the read that chose it and
     /// the start.
@@ -227,7 +228,7 @@ public enum PublisherOutputPolicy {
         bound.transport != .builtIn
     }
 
-    /// Whether an output read again immediately before the engine is prepared and started may
+    /// Whether an output read again immediately before the publisher's IOProc is created or started may
     /// still be rendered to: read, of known transports, and none of them
     /// Bluetooth, an aggregate's active sub-devices included.
     public static func isStillEligibleBeforeStart(deviceID: UInt32, current: AudioDeviceTransportInfo?) -> Bool {

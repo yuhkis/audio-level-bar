@@ -92,8 +92,8 @@ enum PublicProcessedMicrophoneDeviceError: LocalizedError {
 
 /// Publishes this process's rendered audio as a system-visible, mono input device.
 ///
-/// The class does not render audio itself. Call `start()` before starting the audio engine that
-/// sends processed microphone samples to its output node. The process tap uses `.muted`, so those
+/// The class does not render audio itself. Call `start()` before starting the publisher IOProc
+/// that sends processed microphone samples to its output device. The process tap uses `.muted`, so those
 /// samples are captured by the public aggregate device without reaching the physical output.
 ///
 /// A publication makes several lifecycle calls in a row on the main thread:
@@ -317,7 +317,7 @@ final class PublicProcessedMicrophoneDevice {
     /// while this instance holds none, on an earlier run's device whose
     /// removal was refused because it was in use.
     ///
-    /// This app's own publisher engine renders to a physical output device
+    /// This app's own publisher renders to a physical output device
     /// and is captured through the process tap, so it does not make the
     /// aggregate itself run; the value reflects consuming apps only.
     ///
