@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import AudioLevelBarCore
 import CoreAudio
@@ -264,6 +265,48 @@ final class AudioStateWatchTests: XCTestCase {
             harness.state.systemOutputMonitoringState,
             .failed(AudioStateHarness.systemOutputRebuildsExhaustedMessage)
         )
+    }
+
+    func testSleepRebuildsNothingAndTheWakeRebuildsOnceAfterTheWindow() {
+        let harness = exhaustedSystemOutputHarness()
+        defer { harness.tearDown() }
+        let maximum = SystemOutputRecovery.maximumConsecutiveInvalidations
+        // Rebuilds that gave up before the sleep start over at the wake.
+        XCTAssertEqual(harness.lines(withPrefix: "system-output-tap give-up ").count, 1)
+        let builds = systemOutputBuilds(harness)
+
+        harness.powerNotifications.post(name: NSWorkspace.willSleepNotification, object: nil)
+        harness.settle()
+        // Dark wakes run the poll while no level arrives, the meter's
+        // listener fires, and the user retries.
+        harness.state.retrySystemOutputMonitoring()
+        harness.settle()
+        for _ in 0..<(maximum * 2) {
+            harness.advance(by: SystemOutputRecovery.maximumRetryDelay + LifecycleQuietWindow.settle + 0.1)
+            harness.poll()
+            harness.hal.fireListener(
+                deviceID: AudioStateHarness.systemOutputAggregate,
+                selector: kAudioDevicePropertyStreamConfiguration
+            )
+            harness.drainMainQueue()
+            harness.settle()
+        }
+        XCTAssertEqual(systemOutputBuilds(harness), builds, "nothing is rebuilt while asleep")
+        XCTAssertFalse(harness.holdReasons.contains("output-stale"), "a sleeping output's silence is not stale")
+        XCTAssertEqual(harness.lines(withPrefix: "system-output-tap give-up ").count, 1, "no give-up counted in the sleep")
+
+        harness.powerNotifications.post(name: NSWorkspace.didWakeNotification, object: nil)
+        harness.settle()
+        XCTAssertEqual(harness.holdReasons.last, "wake")
+        XCTAssertEqual(systemOutputBuilds(harness), builds, "held by the wake's window")
+        XCTAssertEqual(harness.state.systemOutputMonitoringState, .starting)
+
+        harness.advance(by: LifecycleQuietWindow.settle + 0.1)
+        harness.poll()
+        harness.poll()
+        XCTAssertEqual(systemOutputBuilds(harness), builds + 1, "one rebuild after the wake's window")
+        XCTAssertEqual(harness.state.systemOutputMonitoringState, .active)
+        XCTAssertEqual(harness.lines(withPrefix: "system-output-tap give-up ").count, 1)
     }
 
     // MARK: Processed microphone
