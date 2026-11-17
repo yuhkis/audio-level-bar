@@ -286,23 +286,25 @@ Never force quit while the processed microphone is published; that is one of the
 `make release` (`scripts/release-app.sh`) builds what is handed to other people: `dist/release/Audio Level Bar-<version>.dmg` and its `.sha256`. The tag and the GitHub Release are the maintainer's decision, made after the hardware gate has passed.
 
 1. Pass the hardware gate on a `make app` candidate. The release is compiled again with other flags and stripped, so it is not byte for byte the candidate the gate ran on. It must be built from a commit whose app sources match the gated candidate's: when the gated commit predates `make release`, check that `git diff <gated commit> <release commit> -- Sources Resources Package.swift Vendor ThirdParty` prints nothing.
-2. Build the release on a clean tree with the Developer ID certificate and the notary profile:
+2. Build the release on a clean tree with the release certificate:
 
    ```console
-   env CODESIGN_IDENTITY='<name of your Developer ID Application certificate>' NOTARY_PROFILE='<profile name>' make release
+   env CODESIGN_IDENTITY='<name or SHA-1 of the release certificate>' make release
    ```
 
-3. The summary at the end must say `Distributable: yes`. Confirm with `codesign -dv --verbose=4 "dist/release/Audio Level Bar.app"` that the authority is the certificate issued to you.
-4. Install from the disk image as a release user would: open it, drag the app to Applications, launch it, and check the microphone permission prompt and the meters. Then upload the `.dmg` and its `.sha256` to a draft release, download them on a Mac or a user account that did not build them, and open them there before publishing the release. The script cannot check how Gatekeeper treats a download that carries the quarantine attribute.
+3. The summary at the end must say `Distributable: yes, as a self-signed release that is not notarized`. The script says so only when the SHA-1 of the certificate in the signature equals the one in `scripts/release-certificate-leaf.sha1`.
+4. Install from the disk image as a release user would: open it, drag the app to Applications, launch it, and check the microphone permission prompt and the meters. Then upload the `.dmg` and its `.sha256` to a draft release, download them on a Mac or a user account that did not build them, and open them there before publishing the release, following [Installing from a release](../README.md#installing-from-a-release) to the letter: the script cannot check how Gatekeeper treats a download that carries the quarantine attribute, and those steps are all a user has. When an earlier release exists, install it there first and grant its permissions, then replace it with the new one and check that macOS does not ask for them again.
 
-One-time setup, kept out of the repository:
+The release certificate is a self-signed code-signing certificate that names only the app. Its private key stays out of the repository: in the maintainer's login keychain, with a copy kept somewhere that is neither this repository nor a folder synchronized with it. Its SHA-1 is in `scripts/release-certificate-leaf.sha1`, and `CODESIGN_IDENTITY` takes that value or the certificate's name; `security find-identity -p codesigning` lists it as not trusted, which does not stop `codesign`. macOS ties the permissions a user grants to that certificate, so every release is signed with it. Replacing it, with another self-signed certificate or with a Developer ID certificate, costs every user one more round of permission prompts, and puts the new fingerprint into that file in the same change.
+
+The script also accepts a Developer ID release, which the project does not make at present. Its one-time setup, kept out of the repository:
 
 - Membership of the Apple Developer Program, and a Developer ID Application certificate with its private key in the login keychain. `security find-identity -v -p codesigning` lists it; `CODESIGN_IDENTITY` takes its full name or its SHA-1.
 - A notarytool keychain profile, created with `xcrun notarytool store-credentials '<profile name>'` and either `--apple-id`, `--team-id` and an app-specific password, or an App Store Connect API key (`--key`, `--key-id`, `--issuer`). Only the profile name goes into `NOTARY_PROFILE`; the credentials stay in the keychain.
 
 | Setting | Effect |
 | --- | --- |
-| `CODESIGN_IDENTITY` | The certificate for the app and the disk image. Unset, both are signed ad hoc and the summary says the result is not distributable |
+| `CODESIGN_IDENTITY` | The certificate for the app and the disk image. Unset, both are signed ad hoc and the summary says the result is not distributable; it says the same for a certificate that is neither the release certificate nor Developer ID Application |
 | `NOTARY_PROFILE` | The notarytool keychain profile. Unset, nothing is submitted and the summary says the result is not notarized. Set without `CODESIGN_IDENTITY`, the release is refused |
 | `RELEASE_FLAGS=--zip` | A ZIP archive instead of the disk image; `--dmg --zip` makes both |
 | `RELEASE_FLAGS=--allow-dirty` | Builds from uncommitted changes, for a rehearsal; the bundle records `dirty` and the summary says the result is not distributable |
@@ -321,7 +323,7 @@ The checks, in order. Any failure stops the release, removes the disk image, arc
 9. **Disk image.** `hdiutil create` (HFS+, UDZO) from a folder holding the app and a symbolic link to `/Applications`, signed with the same identity and a secure timestamp, then notarized and stapled with `NOTARY_PROFILE`. It is mounted read-only to check that it holds only the app and the link, that its file names pass the scanner, and that the app passes `verify-app.sh` and has the scanned bundle's content fingerprint.
 10. **ZIP archive**, with `--zip`. `ditto -c -k --keepParent`; its file names are scanned, and it is extracted, verified, and compared with the scanned bundle in the same way. The archive itself is not signed; the app inside it is, with its stapled ticket.
 11. **Checksums.** A `.sha256` file beside each package, checked with `shasum -a 256 -c`.
-12. **Summary.** Version, build, commit and state, the path and scan results, the kind of signature (ad hoc, Developer ID Application, or another certificate; the certificate subject itself is not printed), the notarization result, and the checksums. It ends with `Distributable: yes` only for a clean tree signed with Developer ID and notarized, and otherwise lists what is missing.
+12. **Summary.** Version, build, commit and state, the path and scan results, the kind of signature (ad hoc, the release certificate, Developer ID Application, or another certificate; the certificate subject itself is not printed), the notarization result, and the checksums. It ends with `Distributable: yes` only for a clean tree signed either with the release certificate, compared by its SHA-1 with `scripts/release-certificate-leaf.sha1`, or with Developer ID and notarized; for the release certificate it adds that the result is self-signed and not notarized. Otherwise it lists what is missing.
 
 `dist/` stays git-ignored, and nothing under `dist/release/` is committed. The disk image and its `.sha256` are the only files to upload.
 
