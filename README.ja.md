@@ -97,14 +97,14 @@ osascript -e 'tell application id "io.github.yuhkis.audio-level-bar" to quit'
 
 ## 配布物からの導入
 
-v0.4.0以降のGitHub Releaseには、`Audio Level Bar-<version>.dmg`と、そのSHA-256を記した`Audio Level Bar-<version>.dmg.sha256`を添付します。添付のないバージョンは、次の節の手順でソースからビルドしてください。
+v0.4.0以降のGitHub Releaseには、`Audio-Level-Bar-<version>.dmg`と、そのSHA-256を記した`Audio-Level-Bar-<version>.dmg.sha256`を添付します。添付のないバージョンは、次の節の手順でソースからビルドしてください。
 
 ディスクイメージのアプリは、AppleのDeveloper ID証明書ではなく、このプロジェクト自身の自己署名証明書で署名しており、Appleのnotarizationを受けていません。このプロジェクトがApple Developer Programに加入していないためです。そのためmacOSはアプリの作成者を示せず、初回の起動を利用者自身が許可するまで止めます（手順3）。アプリのビルド元はこのリポジトリで、配布物は`make release`で作ります（[ビルドと実行](#ビルドと実行)）。
 
 1. Releasesページから両方のファイルをダウンロードします。ターミナルで両方を置いたフォルダへ移動し、ダウンロードを確認します。`OK`と表示されます。
 
    ```console
-   shasum -a 256 -c "Audio Level Bar-0.4.0.dmg.sha256"
+   shasum -a 256 -c "Audio-Level-Bar-0.4.0.dmg.sha256"
    ```
 
 2. ディスクイメージを開き、Audio Level Barを隣のApplicationsフォルダへドラッグしてから、ディスクイメージを取り出します。以前のコピーが動作中なら、先にアプリ自身の終了項目で終了してください。加工済みマイクの公開中は強制終了しないでください。
@@ -151,7 +151,7 @@ env CODESIGN_IDENTITY='<name of your certificate>' make app
 
 アドホック署名のままだと、macOSから見て再ビルドのたびに別のアプリになります。designated requirementがバイナリのハッシュ（`codesign -d -r- "dist/Audio Level Bar.app"`で`cdhash H"…"`と表示されます）なので、ビルドし直すたびにマイクとシステムオーディオ録音を許可し直すことになります。証明書で署名すると条件が`identifier "io.github.yuhkis.audio-level-bar" and certificate leaf = H"…"`になり、再ビルドしても同じアプリとして扱われます。これにApple Developer Programは不要で、自己署名のコード署名証明書で足ります。キーチェーンアクセスで「証明書アシスタント」→「証明書を作成…」を開き、名前を決め（例 `audio-level-bar-local`）、Identity Typeを「自己署名ルート」、証明書のタイプを「コード署名」にし、「デフォルトを無効化」にチェックして有効期間を長めにします（既定は365日。切れると作り直しになり、再許可が1回発生します）。そのうえで`env CODESIGN_IDENTITY=audio-level-bar-local make app`を実行します。この証明書は`security find-identity -v -p codesigning`では`CSSMERR_TP_NOT_TRUSTED`として有効一覧から外れますが、信頼設定を変えなくても`codesign`による署名と検証に支障はありません。証明書署名にはhardened runtimeとsecure timestamp（ネットワーク接続が必要）を付け、`Resources/AudioLevelBar.entitlements`の`com.apple.security.device.audio-input` entitlementを埋め込みます。hardened runtimeはこのentitlementのないプロセスにマイク入力を渡さないためです。アドホックと証明書を切り替えた回は再許可が1回発生します。それ以降、証明書署名のビルドでは再ビルドしても許可が残りますが、アドホック署名では再ビルドのたびに再許可が必要です。証明書署名のビルドは実機で起動し、hardened runtimeとentitlementの下でマイクメーターとシステム再生レベル監視が動作することを確認しています。1つのデバイスに結び付けたHAL IOProcによる現在のマイクメーターと加工済みマイクの取り込みで、機器の抜き差し、Bluetoothヘッドセット、スリープ復帰を対象とする[ROADMAP.md](ROADMAP.md)の実機ゲートは、証明書署名のビルドで行い、build 58で通過しました。他の人へ渡す配布物は、`make app`ではなく`make release`で作ります（後述）。
 
-`make release`は他の人へ渡す配布物を作ります。アプリとApplicationsへのリンクを収めた`Audio Level Bar-<version>.dmg`と、そのSHA-256を`dist/release/`に置きます。`make release RELEASE_FLAGS=--zip`はディスクイメージの代わりにZIPアーカイブを、`RELEASE_FLAGS='--dmg --zip'`は両方を作ります。未commitの変更があるworking treeでは実行を拒否します。アプリは`make app`とは別に、コンパイラの出力からビルドディレクトリを除き、実行ファイルからデバッグシンボルを取り除いてビルドします。そのうえで、実行ファイルにビルドディレクトリやホームディレクトリの名前が残っている場合と、[`scripts/scan-private-content.sh`](scripts/scan-private-content.sh)がバンドルのファイル名やファイルに何かを見つけた場合は、パッケージを作りません。この検査には[開発](#開発)で説明するローカルのパターン一覧も必要です。`CODESIGN_IDENTITY`は`make app`と同じく証明書を指定します。このプロジェクトの配布物は、自己署名の配布用証明書で署名します。そのSHA-1フィンガープリントは[`scripts/release-certificate-leaf.sha1`](scripts/release-certificate-leaf.sha1)にあり、秘密鍵は保守者だけが持ちます。この配布物はnotarizationを受けず、他のMacでは利用者が許可するまでGatekeeperが初回の起動を止めます。コマンドが配布できると表示するもう1つの形は、Apple Developer Programへの加入で得られるDeveloper ID Application証明書と、`xcrun notarytool store-credentials`で作ったキーチェーンのプロファイル名である`NOTARY_PROFILE`の組です。これを設定すると、アプリとディスクイメージをAppleのnotarizationサービスへ提出し、ticketをstapleし、Gatekeeperの評価を確かめます。`CODESIGN_IDENTITY`が無ければアドホック署名になり、それ以外の証明書ではこのプロジェクトの配布物になりません。その場合は配布できない旨を表示します。全手順の予行にはこれで足ります。キーチェーンから証明書を選ぶことはなく、`NOTARY_PROFILE`を設定しない限りどこへも送信しません。検査項目の一覧は[開発リファレンス](docs/development.md#release-builds)にあります。
+`make release`は他の人へ渡す配布物を作ります。アプリとApplicationsへのリンクを収めた`Audio-Level-Bar-<version>.dmg`と、そのSHA-256を`dist/release/`に置きます。`make release RELEASE_FLAGS=--zip`はディスクイメージの代わりにZIPアーカイブを、`RELEASE_FLAGS='--dmg --zip'`は両方を作ります。未commitの変更があるworking treeでは実行を拒否します。アプリは`make app`とは別に、コンパイラの出力からビルドディレクトリを除き、実行ファイルからデバッグシンボルを取り除いてビルドします。そのうえで、実行ファイルにビルドディレクトリやホームディレクトリの名前が残っている場合と、[`scripts/scan-private-content.sh`](scripts/scan-private-content.sh)がバンドルのファイル名やファイルに何かを見つけた場合は、パッケージを作りません。この検査には[開発](#開発)で説明するローカルのパターン一覧も必要です。`CODESIGN_IDENTITY`は`make app`と同じく証明書を指定します。このプロジェクトの配布物は、自己署名の配布用証明書で署名します。そのSHA-1フィンガープリントは[`scripts/release-certificate-leaf.sha1`](scripts/release-certificate-leaf.sha1)にあり、秘密鍵は保守者だけが持ちます。この配布物はnotarizationを受けず、他のMacでは利用者が許可するまでGatekeeperが初回の起動を止めます。コマンドが配布できると表示するもう1つの形は、Apple Developer Programへの加入で得られるDeveloper ID Application証明書と、`xcrun notarytool store-credentials`で作ったキーチェーンのプロファイル名である`NOTARY_PROFILE`の組です。これを設定すると、アプリとディスクイメージをAppleのnotarizationサービスへ提出し、ticketをstapleし、Gatekeeperの評価を確かめます。`CODESIGN_IDENTITY`が無ければアドホック署名になり、それ以外の証明書ではこのプロジェクトの配布物になりません。その場合は配布できない旨を表示します。全手順の予行にはこれで足ります。キーチェーンから証明書を選ぶことはなく、`NOTARY_PROFILE`を設定しない限りどこへも送信しません。検査項目の一覧は[開発リファレンス](docs/development.md#release-builds)にあります。
 
 ```console
 env CODESIGN_IDENTITY='<name or SHA-1 of the release certificate>' make release

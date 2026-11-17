@@ -283,7 +283,7 @@ Never force quit while the processed microphone is published; that is one of the
 
 ### Release builds
 
-`make release` (`scripts/release-app.sh`) builds what is handed to other people: `dist/release/Audio Level Bar-<version>.dmg` and its `.sha256`. The tag and the GitHub Release are the maintainer's decision, made after the hardware gate has passed.
+`make release` (`scripts/release-app.sh`) builds what is handed to other people: `dist/release/Audio-Level-Bar-<version>.dmg` and its `.sha256`. The tag and the GitHub Release are the maintainer's decision, made after the hardware gate has passed.
 
 1. Pass the hardware gate on a `make app` candidate. The release is compiled again with other flags and stripped, so it is not byte for byte the candidate the gate ran on. It must be built from a commit whose app sources match the gated candidate's: when the gated commit predates `make release`, check that `git diff <gated commit> <release commit> -- Sources Resources Package.swift Vendor ThirdParty` prints nothing.
 2. Build the release on a clean tree with the release certificate:

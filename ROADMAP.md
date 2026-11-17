@@ -237,7 +237,7 @@ CIでは`make diagnose`、GUI、TCC、デバイス切替、音量書き込み、
 - Repository: `audio-level-bar`
 - License: MIT
 - First public tag: `v0.4.0`（実機ゲート通過後に作成）
-- Release assets: 自己署名の配布用証明書で署名したDMG（`Audio Level Bar-<version>.dmg`）とそのSHA-256（v0.4.0以降、実機ゲート通過後）
+- Release assets: 自己署名の配布用証明書で署名したDMG（`Audio-Level-Bar-<version>.dmg`）とそのSHA-256（v0.4.0以降、実機ゲート通過後）
 - Binary distribution: 自己署名の配布用証明書で署名した、notarizationを受けていないDMGをGitHub Releaseのassetとして配布する（v0.4.0以降、実機ゲート通過後）。`make release`で作り、検査項目は[docs/development.md](docs/development.md#release-builds)に従う
 - Update mechanism: 当初は手動。ネットワークアクセスを伴う自動更新は別の設計変更として扱う
 - Private vulnerability reporting: public化の直後に有効化する。`SECURITY.md`／`SECURITY.ja.md`が指定する報告経路がこれで、有効化するまで報告先が存在しない

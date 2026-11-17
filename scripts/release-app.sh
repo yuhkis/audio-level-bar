@@ -52,8 +52,8 @@ usage() {
     cat <<'USAGE'
 usage: scripts/release-app.sh [--dmg] [--zip] [--allow-dirty]
 
-  --dmg          Package the app as "Audio Level Bar-<version>.dmg" (default)
-  --zip          Package the app as "Audio Level Bar-<version>.zip"
+  --dmg          Package the app as "Audio-Level-Bar-<version>.dmg" (default)
+  --zip          Package the app as "Audio-Level-Bar-<version>.zip"
   --allow-dirty  Build from a working tree with uncommitted changes. The
                  bundle records its state as dirty; do not distribute it.
 
@@ -330,8 +330,8 @@ fi
 
 VERSION=$(plist_value "$INFO_PLIST" CFBundleShortVersionString)
 BUILD=$(plist_value "$INFO_PLIST" CFBundleVersion)
-DMG_NAME="Audio Level Bar-$VERSION.dmg"
-ZIP_NAME="Audio Level Bar-$VERSION.zip"
+DMG_NAME="Audio-Level-Bar-$VERSION.dmg"
+ZIP_NAME="Audio-Level-Bar-$VERSION.zip"
 DMG_PATH="$RELEASE_DIR/$DMG_NAME"
 ZIP_PATH="$RELEASE_DIR/$ZIP_NAME"
 
