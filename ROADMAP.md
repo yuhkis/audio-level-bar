@@ -238,13 +238,13 @@ CIでは`make diagnose`、GUI、TCC、デバイス切替、音量書き込み、
 - License: MIT
 - First public tag: `v0.4.0`（実機ゲート通過後に作成）
 - Release assets: 自己署名の配布用証明書で署名したDMG（`Audio-Level-Bar-<version>.dmg`）とそのSHA-256（v0.4.0以降、実機ゲート通過後）
+- v0.4.0は2026-11-17に公開した。公開前に、ビルドしていないMacで、ブラウザのダウンロードと同じ隔離の属性を付けたDMGから導入し、READMEの手順（SHA-256の照合、システム設定の「このまま開く」、マイクの許可）で起動できることを確かめた。続けて同じ証明書で署名した試験用のbuildへ置き換え、マイクの許可を聞き直されないことを確かめた。隔離の属性はブラウザではなく保守者が付けたもので、試験用のbuildは配布していない
 - Binary distribution: 自己署名の配布用証明書で署名した、notarizationを受けていないDMGをGitHub Releaseのassetとして配布する（v0.4.0以降、実機ゲート通過後）。`make release`で作り、検査項目は[docs/development.md](docs/development.md#release-builds)に従う
 - Update mechanism: 当初は手動。ネットワークアクセスを伴う自動更新は別の設計変更として扱う
 - Private vulnerability reporting: public化の直後に有効化する。`SECURITY.md`／`SECURITY.ja.md`が指定する報告経路がこれで、有効化するまで報告先が存在しない
 
 ## 公開後の作業
 
-- ダウンロードした配布物を、ビルドしていないMacで開いて権限を与え、同じ証明書で署名した次のbuildへ置き換えても権限を聞き直されないことを、最初のReleaseの公開前に確かめる。現在確かめてあるのは、開発機で自己署名の証明書のビルドを作り直しても権限が残ることだけである
 - 利用者が増え、初回の起動をシステム設定で許可する手順が導入の妨げになるなら、Apple Developer Programへ加入してDeveloper ID署名とnotarizationへ移る。`make release`はその形も作れる。証明書を替えた版では、利用者に権限の再許可が1回発生する
 - `PublicProcessedMicrophoneDevice`を専用の直列ライフサイクルキューへ移し、セッションIDで古い結果を捨てる形にする。使用中リスナーは無効化だけの通知にして値をHALワーカーで読み、`AudioState`の`refreshDevices()`と`deviceUID`もワーカーへ移す。起動時の`refreshControls()`と孤立Process Tapの回収も、他の資源を作る前という順序を保ってワーカーへ移す。現在はこれらがメインスレッドで同期的にHALを呼ぶため、応答しないcoreaudiodがUIを止め、利用者を強制終了へ向かわせ得る（[DESIGN.md](DESIGN.md#メインスレッドに残る同期的なhal処理)）
 - Apple音声処理の`AVAudioEngine`の準備、開始、停止を、Apple音声処理の開始の直前と直後にキャッシュを使わずに行う既定デバイスのIDの読み取りも含めて、メインスレッドから専用の直列キューへ移す。エンジンの生成から破棄までを1つのキューに閉じ、「publicへ変更するゲート」の節に記録した`-[AVAudioEngine dealloc]`とAVFAudioのリスナーの競合を再び招かないことを確かめる。現在は、終了時に止めたエンジンをプロセスの終了まで、それ以外で止めたエンジンを開始を認める次の評価まで解放しないことでこの競合を避けており、キューへ移してもこの規則を保つ。終了時のApple音声処理の停止と公開デバイスの破棄も、上限付きの停止待ちに含める。現在は応答しないcoreaudiodで、これらの呼び出しがUIと終了を止め得る。終了の指示から終了までの最悪の時間にも、終了の遅延と停止待ちの間にある、上限のないこれらの手順が含まれる（[DESIGN.md](DESIGN.md#メインスレッドに残る同期的なhal処理)）
