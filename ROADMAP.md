@@ -9,9 +9,9 @@
 - 権利確認、公開文書、CI、公開前監査が完了するまでGitHubリポジトリをprivateのまま維持します。実機ゲートは公開後の最初の作業として行い、その結果を記録してから`v0.4.0`タグを作成します（「publicへ変更するゲート」の節）
 - 本体コードはルート`LICENSE`のMIT Licenseで提供します。適用範囲は出自で決まります。`ThirdParty/`に置いた上流のライセンス本文と、`Vendor/`の静的ライブラリへコンパイルした上流のコードはMITの対象外で、各上流ライセンスが優先します。同じ場所に置いた自作のC ABIラッパはMITで、区別はSPDXヘッダで示します
 - `make app`は本体`LICENSE`をアプリバンドルの`Contents/Resources/LICENSE`へ同梱し、`make verify-app`がソースとの一致を検証します
-- 最初の公開版は`v0.4.0`とし、実機ゲートの通過後に、Developer ID署名とnotarizationを済ませたDMGをRelease assetとして添付します
+- 最初の公開版は`v0.4.0`とし、実機ゲートの通過後に、プロジェクトの自己署名の配布用証明書で署名したDMGをRelease assetとして添付します
 - リポジトリにはarm64用のWebRTC／Abseil静的XCFrameworkを含めます。固定ソース、hash、再生成手順、第三者noticeを追跡可能にします
-- 一般配布バイナリは、`make release`で作るDeveloper ID署名、Hardened Runtime、notarization済みのDMGとし、v0.4.0以降のGitHub Releaseのassetとして配布します。添付は実機ゲートの通過後です。Developer ID Application証明書とnotarytoolの資格情報は保守者が用意し、リポジトリには置きません。更新は手動で、利用者が新しいDMGから置き換えます
+- 一般配布バイナリは、`make release`で作る、自己署名の配布用証明書で署名したHardened RuntimeのDMGとし、v0.4.0以降のGitHub Releaseのassetとして配布します。添付は実機ゲートの通過後です。Appleのnotarizationは受けません。保守者がApple Developer Programに加入していないためで、利用者は初回の起動をシステム設定で許可します。手順はREADMEに記載します。証明書の名前はアプリ名だけで、SHA-1フィンガープリントを`scripts/release-certificate-leaf.sha1`に置き、秘密鍵は保守者が保管してリポジトリには置きません。どの配布物も同じ証明書で署名し、利用者が与えた権限が更新後も残るようにします。更新は手動で、利用者が新しいDMGから置き換えます（2026-11-17、保守者の判断。それまでの方針は、Developer ID署名とnotarizationを済ませたDMGでした）
 - 日常利用する正規版は`/Applications/Audio Level Bar.app`とし、`dist/Audio Level Bar.app`はビルド・検証用候補として扱います
 - ログイン時起動は正規の`/Applications`版を対象にします。正式署名後は`SMAppService`への移行を検討します
 - 複数のMacへ導入するときは、Macごとに再ビルドせず、最初に検証した同一バンドルを転送します。同じソースから別々に生成した候補は、同じMacで作り直した場合でも、source fingerprintが一致する一方でbundle content fingerprintとCDHashが一致せず、同一バイトの`.app`にはならないためです
@@ -135,6 +135,8 @@ CIでは`make diagnose`、GUI、TCC、デバイス切替、音量書き込み、
 
 **実機ゲートは公開後の最初の作業へ回します。** 配布するのはソースだけで、READMEの冒頭と加工済みマイクの節に、現在のメーターと取り込みが実機ゲートを通っていないことを明記しています。ゲートはログ基準で判定するため、公開後に実施しても証拠の価値は変わらず、結果はそのまま公開履歴の次のcommitに記録できます。候補を開発機で日常的に動かした期間にクラッシュレポートもHALの応答停止もありませんでしたが、それは生存の観察であってゲートの証拠ではないので、合否の判断には使いません。`v0.4.0`タグはゲートを通過した候補に対して作成し、それまで公開リポジトリにタグとReleaseは置きません。
 
+**build 58は、スリープの挙動だけを再確認してゲートを判定します（2026-11-17、保守者の判断）。** build 57のゲートはスリープ以外の全ブロックで基準を満たし、build 58がアプリのソースに加えた変更は、スリープ中のシステム再生メーターの回復（`AudioState`、`PowerStateLog`、`SystemOutputRecovery`）だけです。そこで4構成の全ブロックは繰り返さず、②でスリープ復帰2回、③aで1回を、同じ無人方式とログ合否基準で行います。満たせば、build 57の結果と合わせてゲートの通過とします。build 57で確かめたスリープ以外のブロックをbuild 58では実行していないことは、未確認として結果に記録します。
+
 「QuickTime Player、Zoom、Teamsで実発話、先頭欠落、音切れを確認した」は、加工済みマイクを実験的機能として公開する判断に伴い、公開の阻害要因から外しました。理由は「加工済みマイクを実験的機能として公開する判断」の節に記録します。
 
 孤立Process Tapのcleanupは、他アプリのtapを同時に置いた状態で両方向を確認しました。自分のbundleに帰属する孤立tapだけが破棄され、帰属しないtapは残ります。アプリが動作中のときは、使用中と取り残されたtapを区別できないため回収そのものを行いません。
@@ -231,14 +233,16 @@ CIでは`make diagnose`、GUI、TCC、デバイス切替、音量書き込み、
 - Repository: `audio-level-bar`
 - License: MIT
 - First public tag: `v0.4.0`（実機ゲート通過後に作成）
-- Release assets: Developer ID署名＋notarizeしたDMG（`Audio Level Bar-<version>.dmg`）とそのSHA-256（v0.4.0以降、実機ゲート通過後）
-- Binary distribution: Developer ID署名＋notarizeしたDMGをGitHub Releaseのassetとして配布する（v0.4.0以降、実機ゲート通過後）。`make release`で作り、検査項目は[docs/development.md](docs/development.md#release-builds)に従う
+- Release assets: 自己署名の配布用証明書で署名したDMG（`Audio Level Bar-<version>.dmg`）とそのSHA-256（v0.4.0以降、実機ゲート通過後）
+- Binary distribution: 自己署名の配布用証明書で署名した、notarizationを受けていないDMGをGitHub Releaseのassetとして配布する（v0.4.0以降、実機ゲート通過後）。`make release`で作り、検査項目は[docs/development.md](docs/development.md#release-builds)に従う
 - Update mechanism: 当初は手動。ネットワークアクセスを伴う自動更新は別の設計変更として扱う
 - Private vulnerability reporting: public化の直後に有効化する。`SECURITY.md`／`SECURITY.ja.md`が指定する報告経路がこれで、有効化するまで報告先が存在しない
 
 ## 公開後の作業
 
 - 実機ゲート（機器の抜き差し、Bluetoothヘッドセット、スリープ復帰）を[docs/development.md](docs/development.md#hardware-gate-procedure)の手順と「次のゲートのログ合否基準」で実施し、結果を記録する。通過した候補に`v0.4.0`タグを作成し、`make release`で作ったDMGとSHA-256をReleaseへ添付する。ゲートを通過したcommitが`make release`より前のものなら、アプリのソースに差分がないことを[docs/development.md](docs/development.md#release-builds)の手順で確かめた後のcommitから配布物を作る。不合格なら修正し、修正したbuildで再実施する
+- ダウンロードした配布物を、ビルドしていないMacで開いて権限を与え、同じ証明書で署名した次のbuildへ置き換えても権限を聞き直されないことを、最初のReleaseの公開前に確かめる。現在確かめてあるのは、開発機で自己署名の証明書のビルドを作り直しても権限が残ることだけである
+- 利用者が増え、初回の起動をシステム設定で許可する手順が導入の妨げになるなら、Apple Developer Programへ加入してDeveloper ID署名とnotarizationへ移る。`make release`はその形も作れる。証明書を替えた版では、利用者に権限の再許可が1回発生する
 - `PublicProcessedMicrophoneDevice`を専用の直列ライフサイクルキューへ移し、セッションIDで古い結果を捨てる形にする。使用中リスナーは無効化だけの通知にして値をHALワーカーで読み、`AudioState`の`refreshDevices()`と`deviceUID`もワーカーへ移す。起動時の`refreshControls()`と孤立Process Tapの回収も、他の資源を作る前という順序を保ってワーカーへ移す。現在はこれらがメインスレッドで同期的にHALを呼ぶため、応答しないcoreaudiodがUIを止め、利用者を強制終了へ向かわせ得る（[DESIGN.md](DESIGN.md#メインスレッドに残る同期的なhal処理)）
 - Apple音声処理の`AVAudioEngine`の準備、開始、停止を、Apple音声処理の開始の直前と直後にキャッシュを使わずに行う既定デバイスのIDの読み取りも含めて、メインスレッドから専用の直列キューへ移す。エンジンの生成から破棄までを1つのキューに閉じ、「publicへ変更するゲート」の節に記録した`-[AVAudioEngine dealloc]`とAVFAudioのリスナーの競合を再び招かないことを確かめる。現在は、終了時に止めたエンジンをプロセスの終了まで、それ以外で止めたエンジンを開始を認める次の評価まで解放しないことでこの競合を避けており、キューへ移してもこの規則を保つ。終了時のApple音声処理の停止と公開デバイスの破棄も、上限付きの停止待ちに含める。現在は応答しないcoreaudiodで、これらの呼び出しがUIと終了を止め得る。終了の指示から終了までの最悪の時間にも、終了の遅延と停止待ちの間にある、上限のないこれらの手順が含まれる（[DESIGN.md](DESIGN.md#メインスレッドに残る同期的なhal処理)）
 - Apple音声処理は、2026-10-24のユーザーの判断で隠し設定の実験機能にした。HAL IOProcのpublisherで実機ゲートを通した後に、隠し設定を有効にしてヘッドセットの出し入れを別途確かめ、アプリのプロセスにBluetoothのIOも`CADefaultDeviceAggregate-<アプリのPID>`も出ないなら通常の選択肢へ戻すかを判断し、戻さないなら機能を削除する。定期更新を契機にその場で止める方法は、構成変更の最中にIOを止めることになるため避ける

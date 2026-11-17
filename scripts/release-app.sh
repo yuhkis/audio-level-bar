@@ -8,13 +8,16 @@
 #   make release RELEASE_FLAGS='--dmg --zip' both
 #
 # Environment:
-#   CODESIGN_IDENTITY  The certificate to sign with. Anything handed to other
-#                      people needs a "Developer ID Application" certificate;
-#                      unset, the build is signed ad hoc and not distributable.
+#   CODESIGN_IDENTITY  The certificate to sign with. A release is signed with
+#                      the project's self-signed release certificate, whose
+#                      SHA-1 is in scripts/release-certificate-leaf.sha1, or
+#                      with a "Developer ID Application" certificate; unset,
+#                      the build is signed ad hoc and not distributable.
 #   NOTARY_PROFILE     The keychain profile `xcrun notarytool store-credentials`
-#                      created. Set, the app and the disk image are notarized
-#                      and stapled; unset, nothing is notarized, and Gatekeeper
-#                      on another Mac refuses to open the result.
+#                      created, for a Developer ID certificate. Set, the app
+#                      and the disk image are notarized and stapled; unset,
+#                      nothing is notarized, and Gatekeeper on another Mac
+#                      stops the first launch until the user allows it.
 #
 # No certificate is ever picked from the keychain, and nothing is uploaded
 # anywhere but to Apple's notary service, and only when NOTARY_PROFILE is set.
@@ -26,6 +29,10 @@ BUILD_SCRIPT="$SCRIPT_DIR/build-app.sh"
 VERIFY_SCRIPT="$SCRIPT_DIR/verify-app.sh"
 SCAN_SCRIPT="$SCRIPT_DIR/scan-private-content.sh"
 INFO_PLIST="$PROJECT_DIR/Resources/Info.plist"
+# The SHA-1 of the self-signed certificate the project's releases are signed
+# with. It is public: every release carries the certificate, and macOS ties
+# the permissions a user grants to it.
+RELEASE_CERTIFICATE_FILE="$SCRIPT_DIR/release-certificate-leaf.sha1"
 DIST_DIR="$PROJECT_DIR/dist"
 RELEASE_DIR="$DIST_DIR/release"
 APP_NAME="Audio Level Bar.app"
@@ -50,9 +57,11 @@ usage: scripts/release-app.sh [--dmg] [--zip] [--allow-dirty]
   --allow-dirty  Build from a working tree with uncommitted changes. The
                  bundle records its state as dirty; do not distribute it.
 
-CODESIGN_IDENTITY names the signing certificate and NOTARY_PROFILE the
-notarytool keychain profile. Without them the result is signed ad hoc and not
-notarized: enough to rehearse every step, not enough to hand to anyone.
+CODESIGN_IDENTITY names the signing certificate: the project's self-signed
+release certificate (scripts/release-certificate-leaf.sha1), or a Developer ID
+Application certificate together with NOTARY_PROFILE, the notarytool keychain
+profile. Without CODESIGN_IDENTITY the result is signed ad hoc: enough to
+rehearse every step, not enough to hand to anyone.
 USAGE
 }
 
@@ -296,7 +305,7 @@ gatekeeper() {
 # ---- Preconditions ---------------------------------------------------------
 
 cd "$PROJECT_DIR"
-for command_name in codesign ditto hdiutil lipo nm od otool plutil shasum spctl strip xcrun zipinfo; do
+for command_name in codesign ditto hdiutil lipo nm od openssl otool plutil shasum spctl strip xcrun zipinfo; do
     command -v "$command_name" >/dev/null 2>&1 || fail "missing required command: $command_name"
 done
 [ -x "$BUILD_SCRIPT" ] || fail "$BUILD_SCRIPT is missing or not executable"
@@ -307,6 +316,9 @@ done
 if [ -n "$notary_profile" ] && [ -z "$identity" ]; then
     fail "NOTARY_PROFILE is set but CODESIGN_IDENTITY is not. Notarization needs a Developer ID Application certificate: name it in CODESIGN_IDENTITY, or unset NOTARY_PROFILE for a build that is not notarized."
 fi
+release_certificate=$(tr -d ' :\n' <"$RELEASE_CERTIFICATE_FILE" 2>/dev/null | tr '[:lower:]' '[:upper:]')
+printf '%s\n' "$release_certificate" | grep -Eq '^[0-9A-F]{40}$' ||
+    fail "$RELEASE_CERTIFICATE_FILE does not hold one SHA-1 certificate fingerprint"
 
 PROJECT_DIR_PHYSICAL=$(CDPATH= cd -- "$PROJECT_DIR" && pwd -P)
 if GIT_TOPLEVEL=$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null) &&
@@ -492,20 +504,34 @@ distributable=true
 signature_info=$(codesign -d --verbose=4 "$APP_BUNDLE" 2>&1)
 # The authority is the certificate subject, a real name and Team ID for a
 # Developer ID certificate, so it is classified here rather than printed.
+signature_kind=other
 if printf '%s\n' "$signature_info" | grep -Fx 'Signature=adhoc' >/dev/null; then
+    signature_kind=adhoc
     signature_summary="ad hoc"
     distributable=false
 elif printf '%s\n' "$signature_info" | grep -q "^Authority=$DEVELOPER_ID_APPLICATION: "; then
+    signature_kind=developer-id
     signature_summary="Developer ID Application certificate, hardened runtime"
 else
-    signature_summary="a certificate that is not Developer ID Application, hardened runtime"
-    distributable=false
+    mkdir "$WORK_DIR/certificates"
+    codesign -d --extract-certificates="$WORK_DIR/certificates/certificate" "$APP_BUNDLE" 2>/dev/null ||
+        fail "the signing certificate could not be extracted"
+    leaf_hash=$(openssl x509 -inform DER -in "$WORK_DIR/certificates/certificate0" -noout -fingerprint -sha1 2>/dev/null |
+        sed 's/^.*=//; s/://g' | tr '[:lower:]' '[:upper:]')
+    if [ "$leaf_hash" = "$release_certificate" ]; then
+        signature_kind=self-signed-release
+        signature_summary="the project's self-signed release certificate, hardened runtime"
+    else
+        signature_summary="a certificate that is neither the project's release certificate nor Developer ID Application, hardened runtime"
+        distributable=false
+    fi
 fi
 if [ -n "$notary_profile" ]; then
     notarization_summary="accepted and stapled (submission IDs:$NOTARIZED_IDS)"
 else
     notarization_summary="not notarized"
-    distributable=false
+    # A Developer ID release is notarized; the self-signed release cannot be.
+    [ "$signature_kind" = self-signed-release ] || distributable=false
 fi
 [ "$git_state" = clean ] || distributable=false
 
@@ -527,21 +553,27 @@ printf '%s\n' \
 )
 
 if [ "$distributable" = true ]; then
-    printf '\nDistributable: yes. Upload the files above with their .sha256 files.\n'
+    if [ "$signature_kind" = self-signed-release ]; then
+        printf '\nDistributable: yes, as a self-signed release that is not notarized. Gatekeeper on another Mac stops the first launch until the user allows it in System Settings; the README says how. Upload the files above with their .sha256 files.\n'
+    else
+        printf '\nDistributable: yes. Upload the files above with their .sha256 files.\n'
+    fi
     exit 0
 fi
 printf '\nDistributable: NO. Do not hand this build to anyone:\n'
-case "$signature_summary" in
-    "ad hoc")
-        printf -- '- It is signed ad hoc. Set CODESIGN_IDENTITY to your Developer ID Application certificate.\n'
+case "$signature_kind" in
+    adhoc)
+        printf -- '- It is signed ad hoc. Set CODESIGN_IDENTITY to the release certificate named in scripts/release-certificate-leaf.sha1, or to your Developer ID Application certificate.\n'
         ;;
-    "a certificate that is not"*)
-        printf -- '- Its certificate is not a Developer ID Application certificate, which Gatekeeper on another Mac requires.\n'
+    other)
+        printf -- '- Its certificate is neither the release certificate named in scripts/release-certificate-leaf.sha1 nor a Developer ID Application certificate.\n'
+        ;;
+    developer-id)
+        if [ -z "$notary_profile" ]; then
+            printf -- '- It is not notarized. Set NOTARY_PROFILE to the keychain profile created with "xcrun notarytool store-credentials".\n'
+        fi
         ;;
 esac
-if [ -z "$notary_profile" ]; then
-    printf -- '- It is not notarized. Gatekeeper on another Mac refuses an app that is not; set NOTARY_PROFILE to the keychain profile created with "xcrun notarytool store-credentials".\n'
-fi
 if [ "$git_state" != clean ]; then
     printf -- '- It was built from a working tree in state %s.\n' "$git_state"
 fi
